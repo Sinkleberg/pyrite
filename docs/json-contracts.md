@@ -98,26 +98,41 @@ itself: its code is `VALIDATION_FAILED` on every transport, unchanged (see
 "Write refusals" below). The CLI has no transition field, and no CLI write
 command has adopted the new class-level codes yet — see "Write refusals".
 
-Two more joined in 0.25.7 (#66), both now `KB_NOT_FOUND`: the refusal a
-caller with per-KB scoping gets from any MCP tool, prompt or resource for a
-KB outside its readable set (`legacy_error_code: "NOT_FOUND"`; the answer is
-the same whether the KB is private or does not exist), and `kb_orient`'s
-answer for a name that is not a KB (`legacy_error_code: "OPERATION_FAILED"`).
-That scoped refusal carries one static `suggestion` ("Call kb_orient with no
-kb_name to list the KBs you can read."), the same string for a private and
-an absent name and naming no KB. `kb_orient` and `pyrite orient` add
-`did_you_mean` beside the contract's keys: a list of at most three near-match
-KB names the caller may read, empty when there are none (a scoped caller is
-refused by the scoped refusal first, so it sees the static hint, not
-`did_you_mean`). A `kb_name` that is not a string is `VALIDATION_FAILED`; `null`
-is "no name".
+Two more joined in 0.25.7 (#66), both `KB_NOT_FOUND` with
+`legacy_error_code: "NOT_FOUND"`: the refusal a caller with per-KB scoping
+gets from any MCP tool, prompt or resource for a KB outside its readable
+set (the answer is the same whether the KB is private or does not exist),
+and `kb_orient`'s answer for a name that is not a KB. Since #952 both are
+one refusal from the one KB resolver (`services/kb_resolver.py`), on every
+surface, and it carries two things beside the contract's keys: a
+`suggestion` and a `did_you_mean` list. For an unknown name the suggestion
+is one static sentence ("To list the KBs you can read, call kb_orient (MCP)
+or `pyrite orient` (CLI) with no KB name."), the same for a private and an
+absent name and naming no KB; `did_you_mean` holds at most three near-match
+KB names for an unscoped caller (an operator key, auth off, the CLI) and is
+empty for a scoped one, whose readable set is one `kb_orient` call away. For
+the **shortname** of a KB the caller may read -- link syntax only
+(`[[short:id]]`), refused everywhere else -- the suggestion says so and
+`did_you_mean` names the full name, for every caller. A `kb_name` that is not
+a string is `VALIDATION_FAILED`; `null` and a blank string are "no name".
 
 Two more in 0.25.8 (#761): MCP `kb_get` and `kb_update` answer a missing
 entry with `ENTRY_NOT_FOUND` and a KB that does not exist with
 `KB_NOT_FOUND`, both `retryable: false`. Their old codes are in
 `legacy_error_code`: `NOT_FOUND` for `kb_get`, and `UPDATE_FAILED` for
-`kb_update`, which used to answer both with `retryable: true`. Any other
-`kb_update` failure is still `UPDATE_FAILED`, `retryable: true`.
+`kb_update`, which used to answer both with `retryable: true`. The
+`UPDATE_FAILED` legacy code for a missing KB holds for an unscoped caller
+only (an operator key, auth off), the one whose call reached the old
+handler; a scoped caller is refused by the resolver before the handler,
+with `legacy_error_code: NOT_FOUND`, as on every other tool (#952). The
+other `kb_update` refusals answer their class's own code, each with
+`legacy_error_code: UPDATE_FAILED`, the one code the old handler gave
+everything it did not name: `CONFLICT` (a write that lost the race for its
+file, `retryable: true`) and `STORAGE_ERROR` (a storage fault on the write;
+`retryable: true` only for a lock held too long) -- see "Update fields"
+below; a `VALIDATION_FAILED` refusal carries no legacy code (the code did
+not change). Any other `kb_update` failure is still `UPDATE_FAILED`,
+`retryable: true`.
 
 **REST** answers a domain refusal as `{"detail": {"code", "message",
 "retryable", "hint"?}}` — the web client already speaks this shape
@@ -158,7 +173,7 @@ is reproduced by a command in "Reproduce the codes" below, which CI runs.
 
 | `error_code` | Meaning | What to do |
 |---|---|---|
-| `KB_NOT_FOUND` | the KB name is not registered (or, for a scoped caller, not readable). Every CLI write command (`create`, `update`, `delete`, `link`) reports it. | `pyrite kb list` shows the registered names; `pyrite orient` lists the KBs you can read. |
+| `KB_NOT_FOUND` | the KB name is not registered, or, for a scoped caller, not readable (the same answer, byte for byte), or it is a KB's **shortname**: a shortname is link syntax only (`[[short:id]]`), and `-k`, REST `kb` and MCP `kb_name` take the full name (#952). One resolver answers every surface; the refusal carries `did_you_mean` (near matches drawn only from the KBs you can read; for a readable KB's shortname, its full name) and a `suggestion`/`hint`. A blank name names no KB and is never this code: a command that needs one answers `VALIDATION_FAILED`. The one exception is a blank REST path segment (`/api/kbs/%20/permissions`): a path that must name a KB and names none is `KB_NOT_FOUND`. Every CLI write command (`create`, `update`, `delete`, `link`) reports it. | Use a name from `did_you_mean`, or `pyrite orient` (`kb_orient`) with no KB to list the KBs you can read. |
 | `NOT_FOUND` | the entry id does not exist: CLI `get`, `update`, `delete`, `link`. Also a path you named as input (`--body-file`, `--schema-file`, `--alias-file`, `--file`, `import`'s and `add`'s file) that does not exist; a directory there is `VALIDATION_FAILED` (#923). `pyrite backlinks` and `pyrite-read backlinks` on an id that no entry has and nothing links to answer `ENTRY_NOT_FOUND` (the class's code, today; #610 settles the spelling). An id that is only linked to (`[[ghost-page]]`) is answered with its linking entries. MCP `kb_get` and `kb_update` answer `ENTRY_NOT_FOUND`, `retryable: false`, with `legacy_error_code` `NOT_FOUND` and `UPDATE_FAILED` respectively (see "MCP only, for one release" above, #761); `ENTRY_NOT_FOUND` is also the REST code for the class. | `pyrite search <term> -k <kb>` to find the id. |
 | `AMBIGUOUS` | the id was given without a KB (or with a blank `-k`) and more than one KB you can read holds it (see "`AMBIGUOUS`" above). The error lists them in `candidate_kbs`; REST answers `409`. | Repeat the command with `-k <kb>` (`kb` on REST, `kb_name` on MCP), one of `candidate_kbs`. |
 | `UNDECLARED_TYPE` | the KB's `kb.yaml` declares types and this is not one of them. Core types (`note`, `person`, …) are **not** exempt. Override with `allow_undeclared` (MCP, REST body or import query) / `--allow-undeclared` (CLI). The error carries `declared_types` on MCP and REST. | Use a declared type (`pyrite kb schema show <kb>`), or pass the override. |
@@ -234,6 +249,71 @@ non-core types appear in `undeclared_types` and no spelling is `declared`.
 Any row makes the status `warning`. The same field is on `kb health`, REST
 and MCP `kb_health`.
 
+**`index health` → `double_spellings`; `qa validate` →
+`field_spelled_twice`.** `metadata` is not a field: `metadata.k` is a
+second spelling of field `k`, one level only, the same as an alias (Andon
+#994, decision A; ADR-0051, a proposed amendment to ADR-0042 decision 6). A
+file that spells one field twice (`k:` and `metadata.k`, a field and its
+alias, or either under `metadata:`) is read one way, the field's own
+top-level name first, in the model and the index row alike, and an update
+of that field is refused with `VALIDATION_FAILED` naming both spellings
+until one goes; its other fields stay editable. A pair whose two spellings
+hold the same value is still a double spelling: `qa fix` (rule
+`field_spelled_twice`) merges it into the field's own top-level spelling,
+removing the other spelling and losing nothing, and removes a `metadata:`
+block that is left empty; "the same value" is the same YAML value, type
+included (`true` is not `1`, `1` is not `1.0`; the notation is not the
+type: `x`, `'x'` and `"x"` are one string), so a pair that differs in
+any way stays a hand fix, as does a doubly spelled `type`. Only `qa fix`'s
+own call may remove a spelling; an `unset` of one through any surface is
+refused like any other update of the field. On create, a declared field or an alias sent inside the
+`metadata` envelope lands at its own key; only an undeclared key is placed
+under `metadata:` (#178); a field Pyrite or the type manages (`id`,
+`provenance`, a task's `status_change_log`, ...) is refused there as an
+update refuses it, on REST `POST`, MCP `kb_create` and the service
+(`links` and `sources` stay a new entry's own content). A read spells a
+field where the file does: `aliases` is its own row column, so a file with a
+top-level `aliases:` reads it at the top level and never under `metadata`,
+and wikilink resolution by alias reads that column (and the bag, for a file
+that nests it). `index health` lists each
+such field once under `double_spellings`: `{kb, id, field, spellings}`,
+where `spellings` are the dotted paths as the file spells them. The status
+is `warning`. `qa validate` (the KB and one entry alike) reports one
+`field_spelled_twice` issue per field, `severity: "warning"`, with the
+`field`, the file's `path` and `entry_id`, and both spellings in `message`.
+One rule decides both and the refusal
+(`schema.field_aliases.double_spellings` over `spelling_in`).
+
+**`index health` → `unmodellable_frontmatter`; `qa validate` →
+`frontmatter_unmodellable`.** A file whose frontmatter Pyrite cannot model
+(a tagged key `!!str a: 1`, a complex key `? [a, b]`, a duplicate key, a
+non-mapping or one flow-style `{...}` root) gets no write through Pyrite,
+body included; an update is refused with `VALIDATION_FAILED` and the reason
+(#760 (b)). `index health` lists each such file once under
+`unmodellable_frontmatter`: `{kb, id, path, line, reason}`, where `line` is
+the 1-based line of the key (or root) the reason names, `reason` is the
+refusal's own text, and `id` is the reader's id for the file (an explicit
+`id:`, else the one derived from the title; the file's stem when the file
+cannot be read at all). The status is `warning`. `qa validate` (the KB and
+one entry alike) reports one `frontmatter_unmodellable` issue per such file,
+`severity: "warning"`, `field: "frontmatter"`, with the same `path`, `line`
+and `entry_id` and the reason in `message`. One rule decides both
+(`storage.file_operations.frontmatter_refusal`), so a file is listed exactly
+when an update of it is refused, for the same reason, at the same line.
+Frontmatter that does not parse is not listed here: it is the reader's
+`malformed_frontmatter` row. A file that is not a regular file, cannot be
+read or is not UTF-8 is skipped, as the reconcile skips it.
+
+**`index health` → `links_stale_kb`.** A count (top level and under
+`checks`) of link rows that a rebuild would point at a different KB: the
+`kb:` prefix the file wrote, resolved against today's config, is not the KB
+the row stores (#980). It catches a shortname renamed or added in config since
+the file was indexed (`index sync` does not re-read an unchanged file) and a
+row indexed before the full name was stored. A link whose prefix names no KB
+is not counted: it is a broken link (`broken_links`), and a rebuild writes the
+same row. Any count makes the status `warning`; `pyrite index build` re-reads
+every file and clears it.
+
 **Update fields.** An update applies the fields it names: the entry type's
 own fields (its model's fields and every field its `kb.yaml` names for the
 type) and, on every surface, keys the type does not declare, which are
@@ -255,6 +335,69 @@ reading `5` (#561). A request that names fields on its own writes each one
 as sent, even a value equal to the reading.
 A body marked `body_truncated` is refused at any depth of the request on
 every update surface.
+
+**How an update writes (ADR-0042, #955).** The request is applied as
+operations to the file's own text: each named field changes its own lines
+and nothing else (comments, key order, quoting, line endings and every
+other key keep their bytes). **`metadata` is not a field** (Andon #994,
+decision A): `metadata.k`, in a file or a request, is a second spelling of
+field `k`, one level only, the same as an alias. A field has one spelling
+per file: an update is written at the spelling the file uses (`k:`, an
+alias of `k`, or either under `metadata:`; the field's own top-level name
+when the file has none), and a file that spells a field twice is reported
+(`index health` → `double_spellings`, `qa validate` → `field_spelled_twice`)
+and refused for an update of that field. A path whose field would be
+`metadata` (`metadata` alone, `metadata.metadata.k`) is refused at any
+depth, so a key refused at the top level (`type`, `id`, `links`, `body`) is
+refused under `metadata` too. A request that names one field at two
+spellings (`k` and `metadata.k`, a field and its alias, a key at the top
+level and again inside the `metadata` envelope) with different values is
+refused and writes nothing; equal values name one value (#720, extended
+from aliases to every spelling). A path is read as `.`-separated keys with
+`[i]` indexes, so a hand-written key whose own name contains a dot or a
+bracket (`v1.2: old`) cannot be addressed from a request: `{"v1.2": "new"}`
+writes `v1: {"2": new}` beside it. A key is written under the exact name
+sent, so a name with whitespace or a lookalike character (`" id"`, a
+Cyrillic `іd`) is a new key, not the field it resembles. `updated_at` is
+refreshed only where the file already carries it, in its own spelling (the
+separator, a `Z` or an offset, the fraction's digits); a timestamp the
+request sets is written as sent, and one that is no instant is refused. A
+storage fault on the write (a hard-linked file, a lock held too long) is
+`STORAGE_ERROR` (`500` on REST; `retryable: true` only for the lock). A
+request that changes nothing writes
+nothing: the result carries `"changed": false` (CLI and MCP say it only
+then; REST `UpdateResponse` always carries `changed`). The file is replaced
+only if it still holds the bytes the edit was computed on, under a lock in
+the KB's git directory; a file that keeps changing is refused with
+`CONFLICT` (`409` on REST, `retryable: true`). A KB outside git is written
+without a lock and the result says `"locked": false`. An item operation
+(`append`, `remove`) touches the one item it names: the other items keep
+their bytes, and `links`/`sources` take item operations on every surface
+though a set of the whole list is still refused; an appended link is
+checked as a link. Every operation (`set`, `append`, `remove`, `unset`)
+is first parsed into segments once, at the request boundary (`.` between
+keys, `[i]` an index; a key inside the `metadata` envelope such as
+`status_change_log[0]` or `metadata.id` is read the same way, and a path no
+parser can read is refused), then resolved to its field (`field_at`: the
+key, an alias folded to its target, `metadata.k` folded to `k`) and to the
+one path the file spells that field at (`spelling_in`); every refusal is
+decided on that field, and the path written is the path decided on,
+in one place, whatever the path form (`k`, `metadata.k`, an alias,
+`k[0].x`) or surface: a managed field, `type`, `id` and `body` as a key are
+refused for every operation; `links` and `sources` take an item appended or
+removed as a whole item only (`links[0].x` is refused), and an appended
+item must be a mapping the item type reads (a link: `target` and
+`relation`), checked before anything is written. MCP's `append` and
+`remove` are objects (`{field: item}`), `unset` a list of keys; another
+shape is `VALIDATION_FAILED`. `unset` removes a key with its own lines; a `null`
+value is written as `null` (MCP `kb_update` sets a `null` for an undeclared
+key aside, as before). In-process callers (`qa fix`'s link and tag
+repairs, a task's evidence and audit trail) send one operation each
+(`KBService.apply_operations`), never a list read through the model. A templated-folder
+field on a file with no `id:` line does not move the file; the result says
+why in `not_moved`. Frontmatter Pyrite cannot model (a tagged, complex or
+duplicate key; an anchor on the edited key) is refused with
+`VALIDATION_FAILED` and the reason, nothing written.
 
 **Web client.** The web app sends `allow_undeclared: true` on create,
 `POST /api/clip` and import, so its forms, which offer every core and
@@ -393,19 +536,21 @@ they are **not run** (a server would be needed).
 
 | Surface | Call | Success shape |
 |---|---|---|
-| CLI | `pyrite update <id> -k <kb> --title <t>` | **`--format` defaults to `json`:** `{"updated": true, "entry_id": "<id>", "outcome": "done"}`. With `--format rich`: `Updated: <id>`. |
-| MCP | `kb_update` | the block below, plus `"warnings"` when any, `"ignored"` listing keys no update writes, and `"unchanged"` listing fields an echoed read result carried at the value the read returned (not written). |
-| REST (not run) | `PUT /api/entries/{id}` (body carries `kb`) or `PATCH /api/entries/{id}` (body: `kb`, `field`, `value`; one field, `value` a string) | Both return `{"updated": true, "id": "<id>", "warnings": []}`. |
+| CLI | `pyrite update <id> -k <kb> --title <t>`; one item: `--append tags=gamma`, `--remove tags=alpha`, a key: `--unset extra` | **`--format` defaults to `json`:** `{"updated": true, "entry_id": "<id>", "outcome": "done"}`. With `--format rich`: `Updated: <id>`. |
+| MCP | `kb_update`; one item: `"append": {"tags": "gamma"}` or `{"links": {"target": "b", "relation": "related_to"}}`, `"remove": {"tags": "alpha"}`; keys: `"unset": ["extra"]` (a list value under `append`/`remove` means each of its items) | the block below, plus `"warnings"` when any, `"ignored"` listing keys no update writes, and `"unchanged"` listing fields an echoed read result carried at the value the read returned (not written). |
+| REST (not run) | `PUT /api/entries/{id}` (body carries `kb`) or `PATCH /api/entries/{id}` (body: `kb`, `field`, `value`, and `op`: `set` (default), `append`, `remove` or `unset`; one field per call; `value` is the field's value, or the item for `append`/`remove`) | Both return `{"updated": true, "id": "<id>", "warnings": [], "changed": true, "locked": true, "not_moved": null}`. |
 
 <!-- mcp-output: kb_update -->
 ```json
-{"updated": true, "entry_id": "hello", "file_path": "/abs/path/hello.md"}
+{"updated": true, "entry_id": "hello", "file_path": "/abs/path/hello.md", "locked": false}
 ```
 
-`update -f key=value` (CLI) and MCP `kb_update` with an extra key store an
-undeclared field under the entry's `metadata` dict, not as a top-level key.
-Which fields an update may set, and which it refuses or sets aside, is the
-**Update fields** paragraph above.
+`update -f key=value` (CLI) and MCP `kb_update` with an extra key write an
+undeclared field as a top-level key where the request names it (or under
+`metadata:` when the file already holds it there). Which fields an update
+may set, and which it refuses or sets aside, is the **Update fields**
+paragraph above; how it writes, and the `changed`, `locked` and
+`not_moved` fields of the result, is **How an update writes**.
 
 ### `bulk_create` / import
 

@@ -22,7 +22,7 @@ Your AI agents have no memory. Your knowledge is trapped in platform silos. Ever
 - **Plugin system with 19 extension points** — custom entry types, MCP tools, CLI commands, validators, lifecycle hooks, relationship semantics, schema migrations.
 - **Zero running cost locally** — markdown files + SQLite index on your disk. No cloud dependency, no subscription, no vendor lock-in. Your data is plain text files you can read in any editor.
 
-> **Multi-user is experimental. Here be dragons.** Pyrite is solid for one person, their agents, and a team that trusts each other. Accounts, per-KB permissions and the public `/site` work, and each release closes more gaps, but they have not had the review a system holding other people's private data needs. Don't put knowledge on a shared or internet-facing instance that you couldn't live with every user of that instance reading. See [SECURITY.md](SECURITY.md#multi-user-is-experimental).
+> **Multi-user is experimental. Here be dragons.** Pyrite is solid for one person, their agents, and a team that trusts each other. Accounts and per-KB permissions work, and each release closes more gaps, but they have not had the review a system holding other people's private data needs. Don't put knowledge on a shared or internet-facing instance that you couldn't live with every user of that instance reading. See [SECURITY.md](SECURITY.md#multi-user-is-experimental).
 
 ## Quick Start
 
@@ -207,7 +207,7 @@ Extensions implement a Python protocol class with up to 19 methods:
 - `get_relationship_types()` — semantic relationship definitions
 - `get_hooks()` — lifecycle hooks: `before_save`, `after_save`, `before_delete`, `after_delete`, `before_index`
 
-Six extensions ship:
+Five extensions ship:
 
 | Extension | Purpose | Key Types |
 |-----------|---------|-----------|
@@ -216,7 +216,6 @@ Six extensions ship:
 | **encyclopedia** *(example plugin)* | Articles with review workflow | Articles, reviews, voting |
 | **social** *(example plugin)* | Engagement tracking | Social interactions |
 | **journalism-investigation** *(experimental; unsupported)* | Investigative research | Sources, claims, actors, evidence chains |
-| **cascade** | Timeline research | Timeline events, actors, capture lanes |
 
 `zettelkasten`, `encyclopedia` and `social` are example plugins: reference
 code showing how a Pyrite plugin adds entry types, CLI commands, MCP tools
@@ -270,7 +269,7 @@ pyrite/
 ├── plugins/         # Plugin discovery and protocol
 └── formats/         # Content negotiation (JSON, Markdown, CSV, YAML)
 
-extensions/          # Domain-specific plugins (software-kb, zettelkasten [example], encyclopedia [example], social [example], journalism-investigation, cascade)
+extensions/          # Domain-specific plugins (software-kb, zettelkasten [example], encyclopedia [example], social [example], journalism-investigation)
 web/                 # SvelteKit 2 + Svelte 5 frontend (TypeScript + Tailwind)
 kb/                  # Pyrite's own KB (ADRs, backlog, components, standards)
 ```
@@ -370,7 +369,6 @@ pip install -e extensions/software-kb
 pip install -e extensions/zettelkasten
 pip install -e extensions/encyclopedia
 pip install -e extensions/social
-pip install -e extensions/cascade
 pip install -e extensions/journalism-investigation
 ```
 

@@ -13,6 +13,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from .cli.context import require_kb
 from .config import (
     CONFIG_FILE,
     KBConfig,
@@ -113,7 +114,7 @@ def kb_add(
 def kb_remove(name: str = typer.Argument(..., help="KB name")):
     """Remove a KB from the registry."""
     config = load_config()
-
+    require_kb(config, name, output_format="rich")
     if not config.get_kb(name):
         console.print(f"[red]Error:[/red] KB '{name}' not found")
         raise typer.Exit(1)
@@ -149,6 +150,7 @@ def kb_discover(path: Path = typer.Argument(".", help="Path to search")):
 def kb_validate(name: str = typer.Argument(..., help="KB name")):
     """Validate a KB configuration."""
     config = load_config()
+    require_kb(config, name, output_format="rich")
     kb = config.get_kb(name)
 
     if not kb:
@@ -182,6 +184,8 @@ def index_build(
     from .services.kb_service import KBService
 
     config = load_config()
+
+    require_kb(config, kb_name, output_format="rich")
     with index_db_context(config) as db:
         kb_svc = KBService(config, db)
 
@@ -203,6 +207,8 @@ def index_sync(
     from .services.kb_service import KBService
 
     config = load_config()
+
+    require_kb(config, kb_name, output_format="rich")
     with index_db_context(config) as db:
         kb_svc = KBService(config, db)
 
@@ -230,6 +236,8 @@ def index_stats(kb_name: str | None = typer.Argument(None, help="KB name")):
     from .services.kb_service import KBService
 
     config = load_config()
+
+    require_kb(config, kb_name, output_format="rich")
     with index_db_context(config) as db:
         kb_svc = KBService(config, db)
 
@@ -251,6 +259,10 @@ def index_embed(kb_name: str = typer.Argument(..., help="KB to generate embeddin
     )
     from .utils.install_hints import extra_install_command
 
+    # The KB first (#952): a name that is not a KB is refused before the
+    # dependency check, so the answer names the thing that is wrong.
+    config, db = get_config_and_db()
+    require_kb(config, kb_name, db=db, output_format="rich")
     if not is_available():
         # Nothing was embedded: refused, exit 1 (#526). `cli_error` keeps the
         # brackets of `pyrite[semantic]` literal; a markup string would not.
@@ -260,14 +272,7 @@ def index_embed(kb_name: str = typer.Argument(..., help="KB to generate embeddin
             suggestion=f"Install semantic extras: {extra_install_command('semantic')}",
         )
 
-    config, db = get_config_and_db()
     try:
-        if config.get_kb(kb_name) is None:
-            cli_error(
-                f"KB '{kb_name}' not found",
-                error_code="KB_NOT_FOUND",
-                suggestion="run `pyrite-admin kb list` to see registered KBs",
-            )
         if unavailable := semantic_unavailable_for(db):
             # The same cause and remedy `pyrite index embed` gives.
             _, cause, remedy = unavailable
@@ -593,6 +598,8 @@ def schema_show(kb_name: str = typer.Argument(..., help="KB name")):
     import json
 
     config = load_config()
+
+    require_kb(config, kb_name, output_format="rich")
     kb = config.get_kb(kb_name)
 
     if not kb:

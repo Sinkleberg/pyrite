@@ -27,11 +27,13 @@ Three kinds of test live here, each entering at the command line:
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import textwrap
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -322,10 +324,22 @@ def inproc(tmp_path):
     db = PyriteDB(tmp_path / "index.db")
     IndexManager(db, config).index_all()
     db.close()
-    with (
-        patch("pyrite.cli.load_config", return_value=config),
-        patch("pyrite.cli.context.load_config", return_value=config),
-    ):
+    # Every CLI module loads the config under its own name and resolves the
+    # KB it was given against it (#952); an extension's commands included.
+    modules = ["pyrite.cli", "pyrite.cli.context"] + [
+        f"{ext}.cli"
+        for ext in (
+            "pyrite_journalism_investigation",
+            "pyrite_software_kb",
+            "pyrite_zettelkasten",
+            "pyrite_encyclopedia",
+            "pyrite_social",
+        )
+        if importlib.util.find_spec(ext) is not None
+    ]
+    with ExitStack() as stack:
+        for module in modules:
+            stack.enter_context(patch(f"{module}.load_config", return_value=config))
         yield {"config": config, "tmp": tmp_path, "kb": kb_path}
 
 
@@ -937,7 +951,6 @@ SAFE = {
     "pyrite auth github-login": "one credential store; failure raises",
     "pyrite auth github-logout": "one credential store; failure raises",
     "pyrite auth github-setup": "one credential store; failure raises",
-    "pyrite cascade backfill-ji": "single backfill pass; scans clean",
     "pyrite ci": "exits non-zero on the checks' own result",
     "pyrite db backup": "one file copy; failure raises",
     "pyrite db restore": "one file copy; failure raises",
@@ -1024,10 +1037,6 @@ SAFE = {
 READ_ONLY = [
     "pyrite auth status",
     "pyrite auth whoami",
-    "pyrite cascade audit-compat",
-    "pyrite cascade export",
-    "pyrite cascade extract-actors",
-    "pyrite cascade suggest-aliases",
     "pyrite collections list",
     "pyrite collections query",
     "pyrite config",
@@ -1577,6 +1586,10 @@ HANDLERS: dict[tuple[str, str], tuple[str, str]] = {
         "safe",
         "bad metadata reads as empty",
     ),
+    ("extensions/software-kb/src/pyrite_software_kb/cli.py", "sw_migrate_standards"): (
+        "fixed",
+        "TestJournalismAndSoftwareResults",
+    ),
     ("extensions/software-kb/src/pyrite_software_kb/cli.py", "_query_entries"): (
         "safe",
         "bad metadata reads as empty",
@@ -1702,7 +1715,6 @@ HANDLERS: dict[tuple[str, str], tuple[str, str]] = {
         "safe",
         "appends to the errors list the command exits on",
     ),
-    ("pyrite/cli/schema_commands.py", "schema_migrate"): ("fixed", "TestSchemaMigrate"),
     ("pyrite/cli/schema_commands.py", "schema_validate"): (
         "safe",
         "path outside the KB is skipped",

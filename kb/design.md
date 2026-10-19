@@ -81,7 +81,7 @@ contracts are alpha.
 ## What Pyrite is not
 
 - Not a site generator. Publishing is an export. The built-in `/site`
-  ([[adr-0023]]) is experimental.
+  ([[adr-0023]]) was removed in #953.
 - Not a formatter. It does not normalise or repair files unless asked to.
 - Not a database with instant indexes. Search, lists and links come from the
   index, which catches up with the files after a write or a hand edit; a
@@ -139,11 +139,19 @@ Working in a guest file: [[pyrite-is-a-guest-in-state-it-does-not-own]].
 The design above is ahead of the code in these places. Do not assume the
 code follows it; check, and treat a mismatch as the work to do.
 
-- An update re-serialises the whole file from the model (principle 3).
+- An update is operations on the file's own bytes since #955 (B6 P3a), the
+  surfaces take `append`, `remove` and `unset` (P3b), and a create writes its
+  values onto a skeleton the same way (C2), and every other writer sends
+  operations through the same write (P4: `add_link`/`add_links`, rename,
+  `schema migrate`, software-kb's `migrate-standards`; `ids pin` keeps its
+  own no-follow write under the momentary lock). The model has no `save`
+  and no emitter.
   [How Pyrite edits your files](../docs/how-pyrite-edits-your-files.md) holds
-  the examples a fix must pass; `tests/test_doc_write_as_patch.py` runs them
-  and lists each one the code fails today, and how.
-- Save hooks write links and parent status into files (principle 4).
+  the examples; `tests/test_doc_write_as_patch.py` runs them and lists each
+  one the code still fails, and how.
+- Save hooks no longer change an update (principle 4), but what a hook sets
+  in place still reaches that write's index row until the index derives it
+  (P6); a create still takes a hook's changes.
 - An entry with no `id:` takes its identity from its title, and no command
   lists or pins the files missing one (principle 5).
 - A single-entry read returns the type's defaults and normalised values

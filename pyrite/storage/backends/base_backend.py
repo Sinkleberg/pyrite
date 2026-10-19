@@ -120,6 +120,11 @@ class BaseBackend(ABC):
     def _upsert_entry_main(self, entry_id: str, kb_name: str, entry_data: dict[str, Any]) -> None:
         metadata = entry_data.get("metadata", {})
         metadata_json = json.dumps(metadata, cls=_SafeEncoder) if metadata is not None else "{}"
+        # `aliases` has its own column (#1001, decision 5): a read spells a
+        # field where the file does, so a top-level `aliases:` is never put
+        # under the row's `metadata`; the wikilink alias pass reads this.
+        aliases = entry_data.get("aliases") or []
+        aliases_json = json.dumps(list(aliases), cls=_SafeEncoder) if aliases else None
 
         existing = self._session.get(Entry, (entry_id, kb_name))
         if existing:
@@ -147,6 +152,7 @@ class BaseBackend(ABC):
             existing.state = entry_data.get("state")
             existing.lifecycle = entry_data.get("lifecycle", "active")
             existing.extra_data = metadata_json
+            existing.aliases = aliases_json  # type: ignore[assignment]
             existing.updated_at = entry_data.get("updated_at")
             # Microsecond precision + explicit UTC offset — second-level
             # truncation caused `_is_stale` to fire immediately after
@@ -184,6 +190,7 @@ class BaseBackend(ABC):
                 state=entry_data.get("state"),
                 lifecycle=entry_data.get("lifecycle", "active"),
                 extra_data=metadata_json,
+                aliases=aliases_json,
                 created_at=entry_data.get("created_at"),
                 updated_at=entry_data.get("updated_at"),
                 # Always set indexed_at explicitly — the Column's
@@ -314,6 +321,21 @@ class BaseBackend(ABC):
         return results
 
     @staticmethod
+    def _parse_aliases(raw: Any) -> list:
+        """The `aliases` column (a JSON list) as a list; empty when unset."""
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                return []
+            return parsed if isinstance(parsed, list) else []
+        return []
+
+    @staticmethod
     def _parse_metadata(raw: Any) -> dict:
         """Parse extra_data into a dict, handling JSON strings and edge cases."""
         if not raw:
@@ -352,6 +374,7 @@ class BaseBackend(ABC):
             "end_date": entry.end_date,
             "coordinates": entry.coordinates,
             "metadata": metadata,
+            "aliases": self._parse_aliases(entry.aliases),
             "created_at": entry.created_at,
             "updated_at": entry.updated_at,
             "indexed_at": entry.indexed_at,

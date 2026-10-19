@@ -247,7 +247,7 @@ def register_entry_commands(app: typer.Typer) -> None:
         # Not on the outcome contract yet: `--format markdown` and `csv` are taught for
         # this command and the shared option offers json, yaml and rich only. It moves
         # with `pyrite-read get` (ADR-0046, slice 3).
-        with cli_context() as (config, db, svc):
+        with cli_context(kbs=(kb_name,), output_format=output_format) as (config, db, svc):
             try:
                 result = svc.get_entry(entry_id, kb_name=kb_name, readable_kbs=UNSCOPED)
             except AmbiguousEntryError as exc:
@@ -388,7 +388,7 @@ def register_entry_commands(app: typer.Typer) -> None:
         if tags:
             extra["tags"] = [t.strip() for t in tags.split(",")]
 
-        with cli_context() as (config, db, svc):
+        with cli_context(kbs=(kb_name,)) as (config, db, svc):
             # Parse --field key=value pairs with the current KB schema.
             if field:
                 for fv in field:
@@ -491,7 +491,7 @@ def register_entry_commands(app: typer.Typer) -> None:
         """
         require_input_file(file_path)
 
-        with cli_context() as (config, db, svc):
+        with cli_context(kbs=(kb_name,)) as (config, db, svc):
             try:
                 entry, result = svc.add_entry_from_file(
                     kb_name,
@@ -540,6 +540,17 @@ def register_entry_commands(app: typer.Typer) -> None:
         field: list[str] | None = typer.Option(
             None, "--field", "-f", help="Extra field as key=value"
         ),
+        append: list[str] | None = typer.Option(
+            None,
+            "--append",
+            help="Add one item to a list field, as key=value (a JSON list adds each)",
+        ),
+        remove: list[str] | None = typer.Option(
+            None, "--remove", help="Remove one item from a list field, as key=value"
+        ),
+        unset: list[str] | None = typer.Option(
+            None, "--unset", help="Remove a key with its own lines (null is a value, not a removal)"
+        ),
         output_format: str = OUTPUT_FORMAT,
     ) -> Outcome:
         """Update an existing entry."""
@@ -559,10 +570,14 @@ def register_entry_commands(app: typer.Typer) -> None:
             and importance is None
             and lifecycle is None
             and not field
+            and not append
+            and not remove
+            and not unset
         ):
             raise ValidationError(
                 "Nothing to update: name at least one of --title, --body, --body-file, "
-                "--stdin, --tags, --importance, --lifecycle or --field."
+                "--stdin, --tags, --importance, --lifecycle, --field, --append, --remove "
+                "or --unset."
             )
 
         updates: dict[str, Any] = {}
@@ -577,7 +592,7 @@ def register_entry_commands(app: typer.Typer) -> None:
         if tags is not None:
             updates["tags"] = [t.strip() for t in tags.split(",")]
 
-        with cli_context() as (config, db, svc):
+        with cli_context(kbs=(kb_name,)) as (config, db, svc):
             current = svc.get_entry(entry_id, kb_name=kb_name, readable_kbs=UNSCOPED)
             entry_type = current.get("entry_type") if current is not None else None
 
@@ -591,10 +606,26 @@ def register_entry_commands(app: typer.Typer) -> None:
                         v, _field_type_for(config, kb_name, entry_type, k)
                     )
 
+            def items(pairs: list[str] | None) -> dict[str, Any]:
+                out: dict[str, Any] = {}
+                for fv in pairs or []:
+                    if "=" not in fv:
+                        raise ValidationError(f"expected key=value, got '{fv}'")
+                    k, v = fv.split("=", 1)
+                    out[k] = _parse_field_value(v, _field_type_for(config, kb_name, entry_type, k))
+                return out
+
             # ADR-0034 rule 2 and schema validation are the service's (#378):
             # `updates` goes through as given, marker keys included.
             try:
-                written = svc.update(entry_id, kb_name, updates)
+                written = svc.update(
+                    entry_id,
+                    kb_name,
+                    updates,
+                    append=items(append) or None,
+                    remove=items(remove) or None,
+                    unset=list(unset) if unset else None,
+                )
             except ValidationError as e:
                 raise _with_cli_hint(e) from None
         entry = written.entry
@@ -603,11 +634,27 @@ def register_entry_commands(app: typer.Typer) -> None:
         # disk that the update kept (#47, #555) -- the way REST and MCP
         # already return them.
         data: dict[str, Any] = {"updated": True, "entry_id": entry.id}
+        # ADR-0042 (#955), said only when not the usual: nothing changed so
+        # nothing was written; a KB outside git was written with no lock; a
+        # templated-folder field did not move an unpinned file.
+        if not written.changed:
+            data["changed"] = False
+        if not written.locked:
+            data["locked"] = False
+        if written.not_moved:
+            data["not_moved"] = written.not_moved
         if written.warnings:
             data["warnings"] = written.warnings
 
         def rich(console: Console, data: dict) -> None:
-            console.print(f"[green]Updated:[/green] {data['entry_id']}")
+            from rich.markup import escape
+
+            console.print(f"[green]Updated:[/green] {escape(data['entry_id'])}")
+            if data.get("not_moved"):
+                # The templated move that did not happen, and why (an unpinned
+                # file, a target already taken): said here as in the machine
+                # formats (#990, the cold read of #991).
+                console.print(f"  [yellow]Not moved:[/yellow] {escape(data['not_moved'])}")
             _print_warnings(console, data.get("warnings", []))
 
         return Outcome.done(data, rich=rich)
@@ -626,7 +673,7 @@ def register_entry_commands(app: typer.Typer) -> None:
             if not typer.confirm(f"Delete entry '{entry_id}' from KB '{kb_name}'?"):
                 raise typer.Abort()
 
-        with cli_context() as (config, db, svc):
+        with cli_context(kbs=(kb_name,), output_format="rich") as (config, db, svc):
             try:
                 deleted = svc.delete_entry(entry_id, kb_name)
                 if not deleted:
@@ -661,7 +708,7 @@ def register_entry_commands(app: typer.Typer) -> None:
         Same-KB scope only in this release. Cross-KB wikilink rewrite
         and redirect-stub creation are tracked as r1700 follow-ups.
         """
-        with cli_context() as (config, db, svc):
+        with cli_context(kbs=(kb_name,)) as (config, db, svc):
             result = svc.rename_entry(
                 old_id,
                 new_id,
@@ -670,18 +717,37 @@ def register_entry_commands(app: typer.Typer) -> None:
                 dry_run=dry_run,
             )
 
+        from rich.markup import escape
+
+        skipped = result.get("files_skipped") or []
+        partial = result.get("files_partial") or []
+
         def rich(console: Console, result: dict) -> None:
             verb = "Would rename" if dry_run else "Renamed"
-            console.print(f"[green]{verb}:[/green] {old_id} -> {new_id}")
+            console.print(f"[green]{verb}:[/green] {escape(old_id)} -> {escape(new_id)}")
             if update_links:
                 console.print(
                     f"  Wikilink rewrites: "
                     f"{result['links_rewritten']} link(s) in "
                     f"{result['files_rewritten']} file(s)"
                 )
+                # A linking file the rename could not patch, or patched only
+                # in its body, is said here with its reason (#978 delta review).
+                for item in partial:
+                    console.print(
+                        f"  [yellow]Partly rewritten:[/yellow] {escape(item['path'])}: "
+                        f"{escape(item['reason'])}"
+                    )
+                for item in skipped:
+                    console.print(
+                        f"  [yellow]Skipped:[/yellow] {escape(item['path'])}: "
+                        f"{escape(item['reason'])}"
+                    )
             if dry_run:
                 console.print("[yellow]Dry run — no files modified.[/yellow]")
 
+        if skipped or partial:
+            return Outcome.partial(result, rich=rich)
         return Outcome.done(result, rich=rich)
 
     @app.command("link")
@@ -701,7 +767,12 @@ def register_entry_commands(app: typer.Typer) -> None:
         links: list[dict] = []
         failed: list[dict] = []
 
-        with cli_context() as (config, db, svc):
+        with cli_context(
+            kbs=(
+                kb_name,
+                target_kb,
+            )
+        ) as (config, db, svc):
             result = svc.add_link(source, kb_name, target, relation, target_kb=target_kb, note=note)
             tkb = target_kb or kb_name
             # `result["relation"]` is what is actually on disk, not the

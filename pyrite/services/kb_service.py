@@ -10,9 +10,10 @@ import copy
 import dataclasses
 import logging
 import os
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
 from ..config import KBConfig, PyriteConfig
 from ..exceptions import (
     AmbiguousEntryError,
+    ConflictError,
     EntryExistsError,
     EntryNotFoundError,
     IndexSyncRecoveryHintError,
@@ -30,12 +32,14 @@ from ..exceptions import (
     KBReadOnlyError,
     PyriteError,
     SchemaViolationError,
+    StorageBusyError,
+    StorageError,
     UndeclaredTypeError,
     ValidationError,
     public_text,
 )
 from ..models import Entry
-from ..models.base import parse_datetime
+from ..models.base import _timestamp_instant
 from ..models.core_types import id_text
 from ..models.factory import build_entry
 from ..plugins.context import PluginContext
@@ -43,10 +47,32 @@ from ..schema import Link, Source
 from ..schema.enum_check import is_off_list, is_per_element
 from ..storage.database import PyriteDB
 from ..storage.document_manager import DocumentManager
+from ..storage.entry_writer import (
+    FileChanged,
+    create_entry_text,
+    publish_entry_text,
+    raw_scalar,
+    updated_at_stamp,
+)
+from ..storage.file_operations import (
+    AddSubkey,
+    Append,
+    FrontmatterSpan,
+    OperationRefusedError,
+    Remove,
+    ReplaceBody,
+    Set,
+    TimestampText,
+    Unset,
+    apply,
+)
 from ..storage.index import IndexManager, content_hash
 from ..storage.repository import KBRepository
+from ..utils.atomic_write import HardLinked
+from ..utils.file_lock import LOCK_TIMEOUT, LockDirError, LockTimeout
 from ..utils.frontmatter import Frontmatter, NoFrontmatter, describe, split_frontmatter
 from ..utils.metadata import parse_metadata
+from ..utils.yaml import load_yaml
 from .access_policy import named_kb
 from .body_bounds import MARKER_KEYS, ensure_not_truncated
 from .export_service import ExportService
@@ -74,6 +100,39 @@ _MANAGED_FIELDS = frozenset(
 #: REST PATCH, #151). They are left out of ``updatable_fields``, because a read
 #: result carries them and an agent echoing it back would freeze them.
 _TIMESTAMP_FIELDS = frozenset({"created_at", "updated_at"})
+
+#: How long an update waits for the entry's momentary lock before it is a
+#: ``StorageBusyError`` (the lock's own default; a test shortens it).
+_LOCK_TIMEOUT = LOCK_TIMEOUT
+
+#: What an HTML ``datetime-local`` field sends: a date, ``T``, hours and
+#: minutes, no seconds. YAML reads it as a string; it is accepted and written
+#: with ``:00`` seconds, a value YAML reads as a timestamp (the maintainer on
+#: #991). Every other form is accepted iff the loader reads it as a date or
+#: timestamp (``_yaml_reads_a_timestamp``).
+_DATETIME_LOCAL = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d")
+
+
+def _yaml_reads_a_timestamp(spelled: str) -> bool:
+    """Does the loader read ``spelled``, written bare, as a date or a
+    timestamp? The one rule for what a caller may send for a timestamp key
+    (#990): it is written as sent, so it must read back as one. Asked of the
+    loader itself, not of a regex beside it (the cold read of #991: a regex
+    let ``2026-1-5`` and ``+0530`` through, which ruamel reads as strings)."""
+    from collections.abc import Mapping
+
+    if not spelled or "\n" in spelled or "\r" in spelled or "#" in spelled:
+        return False
+    try:
+        loaded = load_yaml(f"k: {spelled}")
+    except Exception:  # noqa: BLE001 - a value YAML cannot parse is no timestamp
+        return False
+    return (
+        isinstance(loaded, Mapping)
+        and list(loaded) == ["k"]
+        and isinstance(loaded["k"], date | datetime)
+    )
+
 
 #: Keys a read result (`kb_get`, `GET /api/entries/{id}`) carries that are the
 #: index's, not the entry's: an update never writes them. With the managed
@@ -254,6 +313,15 @@ class WriteResult:
 
     entry: Entry
     warnings: list[dict[str, Any]] = field(default_factory=list)
+    #: False when the request changed nothing: nothing was written and the
+    #: file's mtime is as it was (ADR-0042 decision 3). Always True for a create.
+    changed: bool = True
+    #: False when the file was replaced with compare-before-replace and no
+    #: lock, because its KB is not in a git repository (D1 (b), #955).
+    locked: bool = True
+    #: Why an update of a templated-folder field did not move the file
+    #: (ADR-0042 decision 5: "not moved: no id pin"), else None.
+    not_moved: str | None = None
 
 
 @dataclass
@@ -281,6 +349,28 @@ def _safe_message(exc: Exception) -> str:
     server-side when it masks it.
     """
     return public_text(exc, log=logger)
+
+
+def _storage_error(entry_id: str, e: OSError) -> StorageError:
+    """A write's filesystem fault as the ``StorageError`` the surfaces show.
+    ``str()`` keeps the detail for the log (``public_text`` logs it, ADR-0037
+    §3). The two faults a caller can act on carry their reason as the public
+    message, with no path in it (#975 review): a file with more than one
+    hard link, and a lock directory that cannot be used."""
+    err = StorageError(f"Cannot write '{entry_id}': {e}")
+    if isinstance(e, HardLinked):
+        err.public_message = (
+            f"Cannot write '{entry_id}': its file has {e.links} hard links, and another "
+            "name for the same file would take a different lock. Break the link (copy "
+            "the file over itself), then retry."
+        )
+    elif isinstance(e, LockDirError):
+        err.public_message = (
+            f"Cannot write '{entry_id}': the lock directory of the repository holding it "
+            "cannot be used (a `.git` file that points at no repository, or a directory "
+            "that cannot be created there); the server log names it."
+        )
+    return err
 
 
 def _refusal_result(exc: Exception) -> dict[str, Any]:
@@ -492,7 +582,7 @@ class KBService:
                 parts.append(f"{field}: {message or 'required'}")
             elif message:
                 # A rule this renderer does not know, or none at all (e.g.
-                # cascade's "Importance must be 1-10, got: 99"): the
+                # journalism-investigation's "Importance must be 1-10, got: 99"): the
                 # validator's own message beats "(expected None, got None)".
                 parts.append(f"{field}: {message}" if field != "?" else message)
             else:
@@ -643,6 +733,29 @@ class KBService:
             return self._registry.get_kb_config(name)
         return None
 
+    def require_kb(self, name: str) -> KBConfig:
+        """The KB ``name`` names, or the one refusal (#952).
+
+        ``PyriteConfig.require_kb`` through this service's database: an
+        unknown name or a shortname is ``KBNotFoundError`` with the
+        resolver's suggestion, a blank name is ``ValidationError`` (the
+        caller named no KB), and a KB registered after the config was
+        loaded is found. Every service method that acts on one KB looks it
+        up here, so no method answers an empty result for a name that is
+        not a KB.
+        """
+        return self.config.require_kb(name, db=self.db)
+
+    def resolve_kb(self, name: object, *, readable_kbs: set[str] | None) -> KBConfig | None:
+        """The one resolver (``kb_resolver.resolve_kb``) through this service's
+        database, for a surface with a scope: REST's ``authz`` and the MCP
+        chokepoints ask here, so no surface holds a storage handle for it
+        (``tests/test_layer_boundaries.py``). None when ``name`` names no KB.
+        """
+        from .kb_resolver import resolve_kb
+
+        return resolve_kb(self.config, name, readable_kbs=readable_kbs, db=self.db)
+
     def get_kb_stats(self, name: str) -> dict[str, Any] | None:
         """Get stats for a specific KB."""
         return self.db.get_kb_stats(name)
@@ -682,7 +795,8 @@ class KBService:
         """
         kb_name = named_kb(kb_name)
         if kb_name:
-            kb_name = self.config.kb_name_for(kb_name)  # a shortname names its KB
+            # The full name only: a shortname is link syntax, refused by the
+            # surface's resolver before this is reached (#952).
             if readable_kbs is not None and kb_name not in readable_kbs:
                 return None
             result = self._read_entry(entry_id, kb_name)
@@ -829,17 +943,17 @@ class KBService:
 
         If a plugin ACTIVE FOR THIS KB provides a type that subclasses the
         core type for the given name, prefer the plugin type. E.g.
-        "event" -> "timeline_event" in a cascade-timeline KB, because the
-        Cascade plugin registers TimelineEventEntry(EventEntry) and declares
-        cascade-timeline in get_kb_types().
+        "event" -> "investigation_event" in a journalism-investigation KB,
+        because that plugin registers InvestigationEventEntry(EventEntry)
+        and declares journalism-investigation in get_kb_types().
 
         Scoping by kb_type is load-bearing, not an optimization. Resolution
         picks the FIRST subclass found, and the unscoped registry dict is
         ordered by plugin discovery, which follows site-packages enumeration
-        and therefore varies between machines. Both cascade's `actor` and
-        social's `user_profile` subclass PersonEntry, so an unscoped
-        `person` resolved to `actor` on one host and `user_profile` on
-        another for identical code -- with the wrong answer silently written
+        and therefore varies between machines. Two plugins' PersonEntry
+        subclasses (the former cascade `actor` and social's `user_profile`)
+        made an unscoped `person` resolve to `actor` on one host and
+        `user_profile` on another for identical code -- with the wrong answer silently written
         to disk. It also meant installing an unrelated extension rewrote
         types in every KB (the tutorial-KB `undeclared_types` symptom).
         See plugin-type-resolution-scoping.
@@ -858,13 +972,13 @@ class KBService:
 
             plugin_types = get_registry().get_all_entry_types_for_kb(kb_type)
             # Even within one KB type several types can subclass the same
-            # core type (cascade declares cascade_event, solidarity_event and
-            # timeline_event, all EventEntry subclasses). Discovery order must
-            # not decide the winner, but neither may alphabetical order --
-            # that picks `cascade_event` over `timeline_event`, silently
-            # changing the type of every new entry in the 5,505-entry
-            # cascade-timeline KB. Prefer the MOST DERIVED class (longest
-            # MRO): TimelineEventEntry -> InvestigationEventEntry ->
+            # core type (journalism-investigation declares investigation_event,
+            # transaction and legal_action, all EventEntry subclasses).
+            # Discovery order must not decide the winner, but neither may
+            # alphabetical order -- that once picked `cascade_event` over
+            # `timeline_event`, silently changing the type of every new entry
+            # in a 5,505-entry timeline KB. Prefer the MOST DERIVED class
+            # (longest MRO): a subclass of InvestigationEventEntry ->
             # EventEntry beats a direct EventEntry subclass, because a deeper
             # chain is a strictly more specific declaration of the same
             # concept. Name is the final tiebreak so equal-depth candidates
@@ -892,12 +1006,10 @@ class KBService:
     # =========================================================================
 
     def _writable_kb(self, kb_name: str) -> KBConfig:
-        # get_kb, not config.get_kb: the registry-aware lookup reads use, so a
-        # KB registered after this process started is writable wherever it is
-        # readable (#764 review), not KB_NOT_FOUND to create/update alone.
-        kb_config = self.get_kb(kb_name)
-        if not kb_config:
-            raise KBNotFoundError(f"KB not found: {kb_name}")
+        # require_kb, the one resolver (#952), through this service's index:
+        # a KB registered after this process started is writable wherever
+        # it is readable (#764 review), not KB_NOT_FOUND to create/update alone.
+        kb_config = self.require_kb(kb_name)
         if kb_config.read_only:
             raise KBReadOnlyError(f"KB is read-only: {kb_name}")
         return kb_config
@@ -979,6 +1091,15 @@ class KBService:
         # A None value means "not given", so the model's default applies.
         fields = {k: v for k, v in spec.items() if k not in MARKER_KEYS and v is not None}
 
+        # A create names a field once, as an update does (#720; #1001
+        # decision 1 and round 4 item 2): `title: A` with
+        # `metadata: {title: B}` is refused, equal values write once.
+        # Decided on the named type's class before anything is popped, so
+        # `title`, `id` and `body` count as fields here too.
+        self._refuse_conflicting_create_spellings(
+            fields.get("entry_type") or fields.get("type") or "note", fields
+        )
+
         named_type = fields.pop("entry_type", None)
         file_type = fields.pop("type", None)
         entry_type = named_type or file_type or "note"
@@ -997,6 +1118,7 @@ class KBService:
         if resolve_type:
             entry_type = self._resolve_entry_type(entry_type, kb_config.kb_type)
         if builder is None:
+            self._refuse_managed_in_envelope(entry_type, kb_config, fields)
             entry = build_entry(entry_type, entry_id=entry_id, title=title, body=body, **fields)
         else:
             entry = builder(entry_type, entry_id, title, body, fields)
@@ -1175,9 +1297,7 @@ class KBService:
         reported as {"created": False, "valid": True, "entry_id": "..."}.
         """
         if validate_only:
-            kb_config = self.config.get_kb(kb_name)
-            if not kb_config:
-                raise KBNotFoundError(f"KB not found: {kb_name}")
+            kb_config = self.require_kb(kb_name)
         else:
             kb_config = self._writable_kb(kb_name)
         hook_ctx = self._hook_ctx(kb_name, kb_config, "create")
@@ -1269,9 +1389,7 @@ class KBService:
         from ..schema import generate_entry_id
         from ..utils.yaml import load_yaml
 
-        kb_config = self.config.get_kb(kb_name)
-        if not kb_config:
-            raise KBNotFoundError(f"KB not found: {kb_name}")
+        kb_config = self.require_kb(kb_name)
         if not validate_only and kb_config.read_only:
             raise KBReadOnlyError(f"KB is read-only: {kb_name}")
 
@@ -1438,8 +1556,26 @@ class KBService:
                 updates[key] = value
         return updates, sorted(ignored), sorted(unchanged)
 
-    def update(self, entry_id: str, kb_name: str, updates: dict[str, Any]) -> WriteResult:
+    def update(
+        self,
+        entry_id: str,
+        kb_name: str,
+        updates: dict[str, Any],
+        *,
+        append: dict[str, Any] | None = None,
+        remove: dict[str, Any] | None = None,
+        unset: list[str] | None = None,
+    ) -> WriteResult:
         """Update an existing entry for a caller, returning it and its warnings.
+
+        ``append`` and ``remove`` name a list field and one item (or a list
+        of items, each one appended or removed); ``unset`` names keys to
+        remove with their own lines (ADR-0042 decision 1; #955, B6 P3b).
+        ``null`` sent in ``updates`` is a value, never a removal. An appended
+        link is checked as a link (``check_link_target``). ``links`` and
+        ``sources`` may be appended to and removed from here, though a set
+        of the whole list is still refused: an item operation touches only
+        the item it names.
 
         The surfaces' update (REST PUT/PATCH, MCP ``kb_update``, CLI
         ``update``). ``updates`` is the caller's field set as sent, ADR-0034
@@ -1457,96 +1593,211 @@ class KBService:
             EntryNotFoundError: If entry not found
             ValidationError: (or a subclass) if the write is refused
         """
-        return self._update(entry_id, kb_name, updates, restrict=True)
+        return self._update(
+            entry_id,
+            kb_name,
+            updates,
+            ops=_item_operations(append, remove, unset),
+            restrict=True,
+        )
+
+    def apply_operations(
+        self, entry_id: str, kb_name: str, ops: list[Any], *, merge_spellings: bool = False
+    ) -> WriteResult:
+        """The in-process form of an operation write: ``ops`` are
+        ``file_operations`` operations (``Set``, ``Append``, ``Remove``,
+        ``Unset``, ``AddSubkey``, ``ReplaceBody``) whose paths name the
+        file's keys as a read returns them; aliases and a key the file nests
+        under ``metadata:`` resolve as for a field update. The services that
+        own a type's managed fields (a task's audit trail and evidence, qa
+        fix's link and tag repairs) write one item here instead of a list
+        read through the model (#955, B6 P3b). ``merge_spellings`` is `qa
+        fix`'s own: the one write a doubly spelled field takes (removing a
+        spelling of an equal pair); no surface passes it (#1001 round 4)."""
+        return self._update(
+            entry_id, kb_name, {}, ops=list(ops), restrict=False, merge_spellings=merge_spellings
+        )
 
     def _update(
-        self, entry_id: str, kb_name: str, updates: dict[str, Any], *, restrict: bool
+        self,
+        entry_id: str,
+        kb_name: str,
+        updates: dict[str, Any],
+        *,
+        restrict: bool,
+        ops: list[Any] | None = None,
+        merge_spellings: bool = False,
     ) -> WriteResult:
+        """The one update: the request as operations applied to the file's own
+        bytes (ADR-0042; #955, B6 P3a).
+
+        Read the file once (``read_for_write``: the bytes are the base, the
+        model is parsed from the same bytes); map the request and the item
+        operations onto the file's own keys and refuse what today refuses
+        (type, managed fields, link shape: ``_resolve_operation``, the one
+        place; conflicting spellings); ``apply()`` them to the decoded bytes; stamp
+        ``updated_at`` in the file's own form where the file carries it and
+        something changed; parse the result, validate it once, run the
+        ``before_save`` hooks on it with their return value ignored (decision
+        4); build the index row from the result before anything is published
+        (a result the index cannot store is refused with nothing written);
+        publish with compare-and-replace under the momentary lock
+        (``publish_entry_text``: no lock outside git, and the result says so).
+        If the file changed between the read and the replace the whole thing
+        runs again from a fresh read, at most ``_UPDATE_ATTEMPTS`` times, then
+        ``ConflictError`` (Q2: last writer wins on the same key). No ``Entry``
+        is serialised: a key the request does not name keeps its bytes.
+        """
         # ADR-0034 marker keys are refused here (a truthy `body_truncated`)
-        # and otherwise never stored. Before #407 this fell out for free: an
-        # undeclared key was always dropped by the loop below, and a marker
-        # key is never a model attribute. Now that an undeclared key is
-        # stored instead of dropped, the markers have to be stripped
-        # explicitly -- the same way `_prepare` does at its own write path --
-        # or an allowed `body_truncated: false` would be persisted as
-        # frontmatter.
+        # and otherwise never stored; `_prepare` does the same at the create
+        # path.
         ensure_not_truncated(updates)
         updates = {k: v for k, v in updates.items() if k not in MARKER_KEYS}
 
         kb_config = self._writable_kb(kb_name)
-
         repo = KBRepository(kb_config)
-        entry = repo.load(entry_id)
-        if not entry:
-            raise EntryNotFoundError(f"Entry not found: {entry_id}{repo.not_found_hint(entry_id)}")
 
-        existing_entry = copy.deepcopy(entry)
-        # `type`/`entry_type` and the empty key are never model attributes on
-        # any entry (`type` is frontmatter-only; `entry_type` is a read-only
-        # `@property` with no setter, so setting it raised a raw
-        # AttributeError instead of a clean refusal -- almost certainly a 500
-        # through REST PATCH, round-2 cold read), so #407's undeclared-key
-        # branch below would route `type` into `metadata` instead of refusing
-        # it: `-f type=hacked` reported `updated: true` and left the real
-        # `type:` frontmatter line untouched -- the #407 symptom recurring
-        # for a reserved key #407's own fix did not cover (round-1 cold
-        # read). Refused unconditionally, not gated by `restrict`: unlike a
-        # managed field an in-process caller might legitimately own (links,
-        # status), no caller -- internal or external -- means anything
-        # sensible by setting `type`, `entry_type` or `""` through an update.
-        #
-        # Checked AFTER the KB and entry lookups above (round-2 cold read):
-        # a missing KB or entry, or a read-only KB, must still answer its own
-        # 404/403 (KBNotFoundError/EntryNotFoundError/KBReadOnlyError), not a
-        # ValidationError that tells the caller their *request* was invalid
-        # when the real problem is that the KB or entry they named doesn't
-        # exist.
-        bad_keys = sorted(k for k in updates if k in ("type", "entry_type") or k == "")
-        if bad_keys:
-            raise ValidationError(
-                f"Cannot set {', '.join(k or '(empty key)' for k in bad_keys)} on "
-                f"{entry_id!r} with an update: an entry's type is fixed once "
-                "created, and a --field key must be non-empty."
+        for _attempt in range(_UPDATE_ATTEMPTS):
+            found = repo.read_for_write(entry_id)
+            if found is None:
+                raise EntryNotFoundError(
+                    f"Entry not found: {entry_id}{repo.not_found_hint(entry_id)}"
+                )
+            path, raw = found
+            try:
+                entry = repo.load_entry_from_bytes(path, raw)
+            except Exception as e:
+                logger.warning("Could not load %s: %s", path, e)
+                raise EntryNotFoundError(
+                    f"Entry not found: {entry_id}{repo.not_found_hint(entry_id)}"
+                ) from None
+            text = raw.decode("utf-8")
+            split = split_frontmatter(text)
+            if not isinstance(split, Frontmatter):
+                raise ValidationError(f"Cannot update '{entry_id}': {describe(split)}")
+            span = FrontmatterSpan(split.yaml_start, split.close_start, split.close_end)
+            file_values = load_yaml(split.text) or {}
+            if not isinstance(file_values, dict):
+                raise ValidationError(
+                    f"Cannot update '{entry_id}': the frontmatter is not a mapping"
+                )
+            # Every operation -- the request's fields as `Set`s and the item
+            # operations alike -- goes through the one resolver, which maps
+            # its path onto the file's own key and decides every refusal on
+            # that key (#973 fix round 1): no operation kind, path form or
+            # surface can reach `apply()` another way.
+            all_ops: list[Any] = []
+            placed: dict[Any, Any] = {}
+            for op in [*_request_operations(updates), *(ops or [])]:
+                resolved = self._resolve_operation(
+                    entry, entry_id, kb_config, file_values, op, restrict, merge_spellings
+                )
+                if isinstance(resolved, Set):
+                    if _same_instant_as_file(file_values, resolved.path, resolved.value):
+                        continue  # the instant the file holds, in another spelling (decision 3)
+                    if resolved.path in placed and placed[resolved.path] == resolved.value:
+                        continue  # the same field named twice with one value
+                    placed[resolved.path] = resolved.value
+                all_ops.append(resolved)
+            self._refuse_conflicting_spellings(entry, updates)
+            try:
+                new_text, _report = apply(text, all_ops, span)
+                changed = new_text != text
+                if changed and "updated_at" in file_values and "updated_at" not in updates:
+                    stamp = _updated_at_stamp(
+                        file_values["updated_at"], _raw_scalar(split.text, "updated_at")
+                    )
+                    if stamp is not None:
+                        new_text, _report = apply(
+                            new_text, [Set("updated_at", stamp)], _frontmatter_span(new_text)
+                        )
+            except OperationRefusedError as e:
+                raise ValidationError(f"Cannot update '{entry_id}': {e.reason}") from e
+
+            # The field set as loaded, for the exception that keeps an off-list
+            # enum value the update does not change (#47, #555).
+            before = copy.deepcopy(self._validated_fields(entry))
+            old_status = getattr(entry, "status", None)
+            if not changed:
+                # A request that changes nothing writes nothing (decision 3);
+                # its warnings are still the file's.
+                warnings = self._validate_write(
+                    entry, kb_name, kb_config, before=before, existing_entry=entry
+                )
+                return WriteResult(entry=entry, warnings=warnings, changed=False)
+
+            new_bytes = new_text.encode("utf-8")
+            try:
+                new_entry = repo.load_entry_from_bytes(path, new_bytes)
+            except Exception as e:
+                raise ValidationError(
+                    f"Cannot update '{entry_id}': the result would not load ({e})"
+                ) from e
+            # Once, on the entry parsed from the result (decision 2): the
+            # type, managed-field and enum refusals happen before anything is
+            # written.
+            warnings = self._validate_write(
+                new_entry, kb_name, kb_config, before=before, existing_entry=entry
+            )
+            extra = {"old_status": old_status} if old_status else {}
+            hook_ctx = self._hook_ctx(kb_name, kb_config, "update", extra)
+            # A before_save hook may refuse (raise); its return value is
+            # ignored and nothing it does reaches the file (decision 4). What
+            # it changes in place is this write's index row, until the next
+            # sync (P6 replaces that with an index-time derivation).
+            self._run_hooks("before_save", new_entry, hook_ctx)
+            try:
+                row = self._index_mgr.row_for(
+                    new_entry, kb_name, path, content_hash=content_hash(new_bytes)
+                )
+            except ValueError as e:
+                raise ValidationError(
+                    f"Cannot update '{entry_id}': the result cannot be indexed ({e})"
+                ) from e
+            try:
+                locked = publish_entry_text(path, new_text, expect=raw, lock_timeout=_LOCK_TIMEOUT)
+            except FileChanged:
+                continue  # re-read and re-apply (decision 10; Q2)
+            except LockTimeout as e:
+                # Another writer held the momentary lock for too long: the
+                # same call can succeed once it is released.
+                raise StorageBusyError(f"Cannot write '{entry_id}': {e}") from e
+            except OSError as e:
+                # The lock directory (`LockDirError`), a hard link
+                # (`HardLinked`), the filesystem: a storage fault whose detail
+                # (a real path) belongs in the log, not in a client-facing
+                # body (ADR-0037 §3; `public_text` logs it). The two a caller
+                # can act on name their reason, without the path.
+                raise _storage_error(entry_id, e) from e
+            break
+        else:
+            raise ConflictError(
+                f"'{entry_id}' in KB '{kb_name}' kept changing while this update ran "
+                f"({_UPDATE_ATTEMPTS} attempts); nothing was written. Read it again and retry."
             )
 
-        _, _, managed = self._field_sets(entry.entry_type, kb_config)
-        if restrict:
-            refused = sorted(k for k in updates if k in managed)
-            if refused:
-                # #557: the usual way to arrive here is a KB using one of these
-                # names for a field of its own (`provenance:` on a draft), so
-                # the refusal says how to keep that field.
-                raise ValidationError(
-                    f"Cannot set {', '.join(refused)} on {entry.entry_type} "
-                    f"'{entry_id}' with an update: Pyrite maintains these fields. "
-                    f"To keep a field of your own under that name, rename it in "
-                    f"the file (for example `{entry.entry_type}_{refused[0]}`) "
-                    "and update the new name."
-                )
+        path, not_moved = self._templated_move(
+            repo, kb_config, new_entry, path, new_text, file_values
+        )
+        row["file_path"] = str(path)
+        self.db.register_kb(
+            name=kb_name,
+            kb_type=kb_config.kb_type,
+            path=str(kb_config.path),
+            description=kb_config.description,
+        )
+        self._index_mgr.index_row(row, path)
+        self._auto_embed(new_entry.id, kb_name)
+        self._run_hooks("after_save", new_entry, hook_ctx)
+        return WriteResult(
+            entry=new_entry, warnings=warnings, changed=True, locked=locked, not_moved=not_moved
+        )
 
-        # Capture old_status before applying updates (for workflow hooks)
-        old_status = getattr(entry, "status", None)
-        # The field set as loaded, for the exception that keeps an off-list
-        # enum value the update does not change (#47, #555). Deep-copied: the
-        # updates below must not reach into it.
-        before = copy.deepcopy(self._validated_fields(entry))
-
-        # A timestamp may arrive as a string: REST `PATCH /entries/{id}` sends
-        # `value: str` and the CLI passes `--field updated_at=…`. Coerce it
-        # before it is assigned -- the file, the model and the index all expect
-        # a `datetime`, and a string used to reach
-        # `IndexManager._entry_to_dict` (`entry.<ts>.isoformat()`) *after* the
-        # file had been written: an `AttributeError` that left the file written
-        # and the index stale, so the two diverged (#173 review). A naive
-        # string is read as UTC by `parse_datetime`, like ingestion.
-        for ts_key in ("created_at", "updated_at"):
-            if ts_key in updates and not isinstance(updates[ts_key], datetime):
-                updates[ts_key] = parse_datetime(updates[ts_key])
-
-        # One name per field (#697): an alias or target key (`actors`,
-        # `participants`, `source`) sets the attribute the class reads, whether
-        # it arrives at the top level or inside `metadata`, never the bag.
-        from ..schema.field_aliases import attribute_for, refuse_conflicting_spellings
+    @staticmethod
+    def _refuse_conflicting_spellings(entry: Entry, updates: dict[str, Any]) -> None:
+        """One name per field (#697, #720): both spellings of one field with
+        different values are refused; equal values name one value."""
+        from ..schema.field_aliases import refuse_conflicting_spellings
 
         refuse_conflicting_spellings(
             type(entry),
@@ -1554,82 +1805,290 @@ class KBService:
             {k: v for k, v in updates.items() if k != "metadata"},
             updates["metadata"] if isinstance(updates.get("metadata"), dict) else {},
         )
-        routed: dict[str, Any] = {}
-        for key, value in updates.items():
-            if key == "metadata" and isinstance(value, dict):
-                rest = {}
-                for mk, mv in value.items():
-                    attr = attribute_for(entry, mk)
-                    if attr is None:
-                        rest[mk] = mv
-                    else:
-                        routed[attr] = mv
-                if rest or not value:
-                    routed["metadata"] = rest
+
+    @staticmethod
+    def _refuse_conflicting_create_spellings(entry_type: str, fields: dict[str, Any]) -> None:
+        """One name per field on create (#720; #1001 round 4 item 2)."""
+        from ..models.core_types import get_entry_class
+        from ..schema.field_aliases import refuse_conflicting_spellings
+
+        try:
+            cls = get_entry_class(entry_type)
+        except Exception:  # an unknown type is refused later, by name
+            return
+        refuse_conflicting_spellings(
+            cls,
+            entry_type,
+            {k: v for k, v in fields.items() if k != "metadata"},
+            fields["metadata"] if isinstance(fields.get("metadata"), dict) else {},
+        )
+
+    def _refuse_managed_in_envelope(
+        self, entry_type: str, kb_config: KBConfig, fields: dict[str, Any]
+    ) -> None:
+        """A create's ``metadata`` envelope (REST POST, MCP ``kb_create``, the
+        service) names fields by a second spelling (Andon #994, decision A);
+        a field Pyrite or the type manages is refused there, as an update
+        refuses it (#1001, decision 6). ``links`` and ``sources`` are a new
+        entry's own content and stay creatable, as at the top level."""
+        from ..models.core_types import get_entry_class
+        from ..schema.field_aliases import NotAFieldError, field_at, path_segments
+
+        envelope = fields.get("metadata")
+        if not isinstance(envelope, dict):
+            return
+        cls = get_entry_class(entry_type)
+        managed = self._field_sets(entry_type, kb_config)[2] - _ITEM_LISTS
+        for key in envelope:
+            if not isinstance(key, str):
                 continue
-            routed[attribute_for(entry, key) or key] = value
-        updates = routed
+            try:
+                field, _rest = field_at(cls, entry_type, ("metadata", *path_segments(key)))
+            except (NotAFieldError, ValueError) as e:
+                # `metadata.k` inside the envelope, an unreadable path: not
+                # a field, so not a key a new file gets (decision A).
+                raise ValidationError(f"Cannot create a {entry_type}: {e}") from None
+            if field in managed:
+                raise ValidationError(
+                    f"Cannot set {field} on a new {entry_type} through `metadata`: Pyrite "
+                    "maintains these fields. To keep a field of your own under that name, "
+                    f"name it differently (for example `{entry_type}_{field}`)."
+                )
 
-        # Apply updates
-        for key, value in updates.items():
-            if not hasattr(entry, key):
-                # A key with no model attribute: kb.yaml-declared or not,
-                # `create` stores it rather than dropping it (`build_entry`
-                # puts unknown kwargs in metadata), so `update` follows the
-                # same rule -- this is what generalises the old
-                # `schema_fields`-only branch. A key already recorded under
-                # `extra_frontmatter` (an undeclared key on a typed entry,
-                # loaded from the file) stays there; everything else merges
-                # into `metadata`, where `GenericEntry`/`TaskEntry` promote it
-                # back to a top-level frontmatter key on save, same as create.
-                if key in entry.extra_frontmatter:
-                    entry.extra_frontmatter[key] = value
-                else:
-                    entry.metadata = {**(entry.metadata or {}), key: value}
-                continue
-            value = _as_field_type(entry, key, value)
-            # Metadata is a bag of keys — merge shallowly so a partial update
-            # (e.g. just review_comments) does not clobber other metadata.
-            if key == "metadata" and isinstance(value, dict):
-                merged = dict(getattr(entry, "metadata", None) or {})
-                merged.update(value)
-                setattr(entry, key, merged)
-            else:
-                setattr(entry, key, value)
+    def _resolve_operation(
+        self,
+        entry: Entry,
+        entry_id: str,
+        kb_config: KBConfig,
+        file_values: dict[str, Any],
+        op: Any,
+        restrict: bool,
+        merge_spellings: bool = False,
+    ) -> Any:
+        """THE place an operation's path is resolved onto the file and every
+        refusal is decided (#955 acceptance 1; #971 and #973 fix rounds;
+        Andon #994, decision A).
 
-        # An explicit `updated_at` in the update is the caller's value; only
-        # stamp the bookkeeping time when they did not supply one, and tell the
-        # repository below not to stamp over a supplied one either (#151).
-        explicit_updated_at = "updated_at" in updates
-        if not explicit_updated_at:
-            entry.touch_updated_at()
+        Which field: ``field_at`` (``schema/field_aliases``). ``metadata`` is
+        not a field: ``metadata.k`` is a second spelling of field ``k``, one
+        level only, the same as an alias, so ``metadata.type``,
+        ``metadata.evidence`` and ``metadata.links`` are those fields, an
+        alias is its target, and a path whose field would be ``metadata``
+        (the bare key, ``metadata.metadata.k``) is refused at any depth. The
+        rest of the path (``[0].x``) follows the field unchanged.
 
-        # Refuse before anything is written: the file must stay exactly as it was.
-        warnings = self._validate_write(
-            entry, kb_name, kb_config, before=before, existing_entry=existing_entry
+        Where: ``spelling_in`` -- the one path the file spells the field at
+        (its own name, an alias, or either under ``metadata:``), the field's
+        own top-level name when the file has none. A file that spells the
+        field twice refuses the update (``SpelledTwiceError``): no spelling
+        is edited while another stands.
+
+        Refusals, on the field, for every operation kind (set, append,
+        remove, unset, add-subkey) alike: ``type``/``entry_type`` and the
+        empty key, never settable; ``body`` as a frontmatter key; under
+        ``restrict`` (a surface), a field Pyrite or the type manages
+        (``_field_sets``), except an item appended to or removed from
+        ``links`` or ``sources`` as a whole item -- ``links[0].x`` is refused.
+        An appended link or source item is checked as one before anything is
+        written (``check_link_target``: what the index could not store).
+        Values are validated as the field's type (``_value_for_file``) and
+        written as the caller sent them, never as the model's reading.
+        """
+        from ..schema.field_aliases import (
+            NotAFieldError,
+            SpelledTwiceError,
+            field_at,
+            spelling_in,
+            values_identical,
         )
 
-        # Run before_save hooks
-        extra = {"old_status": old_status} if old_status else {}
-        hook_ctx = self._hook_ctx(kb_name, kb_config, "update", extra)
-        entry = self._run_hooks("before_save", entry, hook_ctx)
-        # Preserve the update exception for unchanged on-disk enum values.
-        warnings = self._validate_write(
-            entry, kb_name, kb_config, before=before, existing_entry=existing_entry
+        if isinstance(op, ReplaceBody):
+            return op
+        if (
+            merge_spellings
+            and isinstance(op, Unset)
+            and tuple(getattr(op, "path", ()) or ()) == ("metadata",)
+            and _nested_block_is_all_equal_pairs(entry, file_values)
+        ):
+            # `qa fix`'s merge removing the last nested spelling(s): the
+            # emptied `metadata:` block goes with them, so no `metadata: {}`
+            # the author never wrote appears (#1001 round 4, item 4).
+            return Unset(("metadata",))
+        try:
+            field, rest = field_at(type(entry), entry.entry_type, getattr(op, "path", None))
+        except NotAFieldError as e:
+            raise ValidationError(f"Cannot update {entry_id!r}: {e}") from None
+        except ValueError as e:
+            raise ValidationError(f"Cannot update {entry_id!r}: {e}") from None
+
+        # `type`/`entry_type` and the empty key are never model attributes on
+        # any entry (`type` is frontmatter-only; `entry_type` is a read-only
+        # property), and no caller means anything sensible by setting them
+        # through an update. Refused unconditionally, not gated by `restrict`.
+        # Checked AFTER the KB and entry lookups: a missing KB or entry, or a
+        # read-only KB, must still answer its own 404/403.
+        if field in ("type", "entry_type") or field == "":
+            raise ValidationError(
+                f"Cannot set {field or '(empty key)'} on {entry_id!r} with an update: "
+                "an entry's type is fixed once created, and a --field key must be "
+                "non-empty."
+            )
+        if field == "body":
+            # The request named `body` where only a frontmatter key can land
+            # (under `metadata`): the body is the entry's text, never a key.
+            raise ValidationError(
+                f"Cannot set body on {entry_id!r} as a frontmatter key: the body is "
+                "the entry's text; send it as `body` at the top level."
+            )
+        whole_item = isinstance(op, Append | Remove) and not rest
+        if restrict:
+            _, _, managed = self._field_sets(entry.entry_type, kb_config)
+            if field in managed and not (whole_item and field in _ITEM_LISTS):
+                # #557: the usual way to arrive here is a KB using one of these
+                # names for a field of its own (`provenance:` on a draft), so
+                # the refusal says how to keep that field.
+                raise ValidationError(
+                    f"Cannot set {field} on {entry.entry_type} '{entry_id}' with an "
+                    "update: Pyrite maintains these fields. To keep a field of your "
+                    "own under that name, rename it in the file (for example "
+                    f"`{entry.entry_type}_{field}`) and update the new name."
+                )
+        try:
+            head = spelling_in(file_values, type(entry), entry.entry_type, field)
+        except SpelledTwiceError as e:
+            # The one write a doubly spelled field takes, and only from `qa
+            # fix`'s own call (`merge_spellings`, #1001 round 4 item 3):
+            # unsetting one of its spellings when every spelling holds the
+            # same YAML value, type included (`values_identical`: `true` is
+            # not `1`, item 1), which loses nothing and is how the pair is
+            # merged into the field's own name (decision 2). The field's own
+            # name (the first spelling) is never the one removed.
+            path_sent = tuple(getattr(op, "path", ()) or ())
+            values = [_value_at(file_values, p) for p in e.spellings]
+            if (
+                merge_spellings
+                and isinstance(op, Unset)
+                and not rest
+                and path_sent in e.spellings[1:]
+                and all(values_identical(v, values[0]) for v in values)
+            ):
+                return Unset(path_sent)
+            raise ValidationError(
+                f"Cannot update {field} on {entry_id!r}: {e}. A field has one spelling "
+                "per file; remove one of them by hand, or `pyrite qa fix` merges an "
+                "equal pair, then update."
+            ) from None
+
+        if field in _ITEM_LISTS and head[0] == "metadata":
+            # ADR-0051 makes `metadata.links` a spelling of `links`, but the
+            # model and the index read `links`/`sources` at the top level
+            # only (#1025), so an item written at `metadata.links` is never
+            # indexed, never seen by the duplicate check, and every retry
+            # adds a copy (#975 cold read). Until the reader reads that
+            # spelling, the writer refuses it with the reason, rather than
+            # write where nothing reads.
+            raise ValidationError(
+                f"Cannot write {field} on {entry_id!r}: the file spells it as "
+                f"`metadata.{head[-1]}`, a spelling of {field} (ADR-0051) that the reader "
+                f"does not read yet (#1025), so nothing there is indexed or deduplicated. "
+                "Move the list to the top level, then retry."
+            )
+
+        # The output path is the tuple `field_at` decided on, with the file's
+        # spelling in place of the field: never re-joined into a string that
+        # `apply()` would parse again (#1001 review: a one-segment head
+        # `status_change_log[0]` re-read as a list index).
+        path: tuple[Any, ...] = (*head, *rest)
+        if isinstance(op, Set):
+            value = (
+                self._value_for_file(entry, field, op.value) if not rest else _plain_value(op.value)
+            )
+            spelled = path[0] if isinstance(path, tuple) and len(path) == 1 else path
+            if _same_instant_as_file(file_values, spelled, value):
+                return Set(path, file_values[spelled])  # the same instant: no change
+            return Set(path, value)
+        if isinstance(op, Append | Remove):
+            value = _plain_value(op.value)
+            if isinstance(op, Append) and whole_item and field in _ITEM_LISTS:
+                value = _checked_item(entry, field, value)
+            return type(op)(path, value)
+        if isinstance(op, AddSubkey):
+            return AddSubkey(path, op.key, _plain_value(op.value))
+        if isinstance(op, Unset):
+            return Unset(path)
+        raise ValidationError(f"Cannot update {entry_id!r}: unknown operation {op!r}.")
+
+    @staticmethod
+    def _value_for_file(entry: Entry, key: str, value: Any) -> Any:
+        """``value`` validated as ``key``'s type, as plain data for ``apply``.
+
+        A timestamp the caller spelled is written as sent (``TimestampText``:
+        its own separator, zone form and fraction digits, bare where the
+        file's value was bare), never as the model's reading of it; one that
+        is no instant is refused. A ``datetime`` (an in-process caller's) is
+        written in the house spelling.
+        """
+        if key in _TIMESTAMP_FIELDS and not isinstance(value, date):
+            # A `datetime` or a `date` from an in-process caller is written as
+            # the value it is (a date stays a date, #990). Text is accepted
+            # iff the loader reads it back as a date or timestamp, not by
+            # `fromisoformat`'s wider rule (a week date, an hour-only time or
+            # a compact date would be written as a plain string or an int,
+            # #990), nor by a regex beside the loader (#991). The one form
+            # read as a string and still accepted is `datetime-local`'s
+            # `YYYY-MM-DDTHH:MM`, written with `:00` seconds.
+            spelled = str(value).strip()
+            if _DATETIME_LOCAL.fullmatch(spelled):
+                spelled += ":00"
+            if not _yaml_reads_a_timestamp(spelled):
+                raise ValidationError(
+                    f"Cannot set {key} on {entry.entry_type} '{entry.id}': {spelled!r} is "
+                    "not a timestamp YAML reads. Send YYYY-MM-DD, optionally followed by T "
+                    "or a space, HH:MM:SS, a fraction, and Z or an offset such as +05:30 "
+                    "(e.g. 2026-01-15T09:00:00Z), or YYYY-MM-DDTHH:MM, which is written "
+                    "with :00 seconds."
+                )
+            value = TimestampText(spelled)
+        if hasattr(entry, key):
+            _as_field_type(entry, key, value)  # validation only: refuses before any write
+        return _plain_value(value)
+
+    def _templated_move(
+        self,
+        repo: KBRepository,
+        kb_config: KBConfig,
+        entry: Entry,
+        path: Path,
+        text: str,
+        file_values: dict[str, Any],
+    ) -> tuple[Path, str | None]:
+        """The one move an update makes (decision 5): a type whose subdirectory
+        is templated by a field (``backlog/{status}``) moves a *pinned* file
+        when that field changes; an unpinned file stays, and the result says
+        why. Returns ``(path, not_moved)``."""
+        if not self._doc_mgr._uses_templated_subdir(repo, entry):
+            return path, None
+        subdir = repo._infer_subdir(entry)
+        target = repo._contained(
+            kb_config.path / subdir / path.name if subdir else kb_config.path / path.name
         )
-
-        # Save to file, register KB, and re-index
-        self._doc_mgr.save_entry(
-            entry, kb_name, kb_config, touch_updated_at=not explicit_updated_at
-        )
-
-        # Auto-embed for semantic search
-        self._auto_embed(entry.id, kb_name)
-
-        # Run after_save hooks
-        self._run_hooks("after_save", entry, hook_ctx)
-
-        return WriteResult(entry=entry, warnings=warnings)
+        if target.resolve() == path.resolve():
+            return path, None
+        if "id" not in file_values:
+            return path, "no id pin: the file keeps its place; add an `id:` line to let it move"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            create_entry_text(target, text)
+        except FileExistsError:
+            # The update is already published at the old path; the move is
+            # the part that did not happen. Said with the KB-relative target,
+            # never a raw error with an absolute path (#990); the index row
+            # keeps pointing at the file's real place.
+            where = target.relative_to(kb_config.path).as_posix()
+            return path, f"target exists: the file keeps its place; `{where}` already holds a file"
+        self._doc_mgr._remove_old_file(path, kb_config.path)
+        entry.file_path = target
+        return target, None
 
     def update_entry(self, entry_id: str, kb_name: str, **updates) -> Entry:
         """
@@ -1660,9 +2119,7 @@ class KBService:
             KBNotFoundError: If KB not found
             KBReadOnlyError: If KB is read-only
         """
-        kb_config = self.config.get_kb(kb_name)
-        if not kb_config:
-            raise KBNotFoundError(f"KB not found: {kb_name}")
+        kb_config = self.require_kb(kb_name)
         if kb_config.read_only:
             raise KBReadOnlyError(f"KB is read-only: {kb_name}")
 
@@ -1687,23 +2144,7 @@ class KBService:
         if entry:
             self._run_hooks("after_delete", entry, hook_ctx)
 
-        if file_deleted:
-            self._drop_site_page(entry_id, kb_name)
         return file_deleted
-
-    def _drop_site_page(self, entry_id: str, kb_name: str) -> None:
-        """Take a deleted entry off the pre-rendered `/site` (P-S3): its page,
-        and its row in the KB's index pages. Only a cache that exists is
-        touched. Best effort: a failure is logged and never fails the delete;
-        the next render prunes what this missed."""
-        from .site_cache import SiteCacheService
-
-        try:
-            SiteCacheService(self.config, self.db).invalidate_entry(entry_id, kb_name)
-        except Exception:
-            logger.warning(
-                "Could not drop the /site page of %s/%s", kb_name, entry_id, exc_info=True
-            )
 
     def rename_entry(
         self,
@@ -1732,9 +2173,7 @@ class KBService:
         Returns:
             See KBRepository.rename for the result-dict shape.
         """
-        kb_config = self.config.get_kb(kb_name)
-        if not kb_config:
-            raise KBNotFoundError(f"KB not found: {kb_name}")
+        kb_config = self.require_kb(kb_name)
         if kb_config.read_only and not dry_run:
             raise KBReadOnlyError(f"KB is read-only: {kb_name}")
 
@@ -1830,16 +2269,22 @@ class KBService:
             who then greps the file for what they typed). The duplicate key
             is ``(target, kb, relation)``, with targets compared as text: a
             second, different relation between the same two entries is a new
-            link, not a duplicate (#396).
+            link, not a duplicate (#396). The check reads the file once, before
+            the write; a link another writer appends between that read and
+            the publish is not re-checked, and both items land (Q2: the
+            publish re-applies on ``FileChanged`` and the last writer wins; a
+            duplicate pair is what the check tolerates on a replay). The
+            file must spell ``links`` at the top level: an item appended at
+            ``metadata.links`` would be read by nothing (not indexed, not
+            seen by this check: the reader's gap, #1025), so that spelling is
+            refused with the reason (``_resolve_operation``).
         """
         # A malformed request is refused before anything is loaded or written
         # (#846); every link writer passes through this one check.
         target_id, relation, note = check_link_spec(
             target_id, relation, note=note, target_kb=target_kb
         )
-        kb_config = self.config.get_kb(source_kb)
-        if not kb_config:
-            raise KBNotFoundError(f"KB not found: {source_kb}")
+        kb_config = self.require_kb(source_kb)
         if kb_config.read_only:
             raise KBReadOnlyError(f"KB is read-only: {source_kb}")
 
@@ -1849,9 +2294,7 @@ class KBService:
             raise EntryNotFoundError(f"Entry not found: {source_id}")
 
         tkb = target_kb or source_kb
-        target_kb_config = self.config.get_kb(tkb)
-        if not target_kb_config:
-            raise KBNotFoundError(f"KB not found: {tkb}")
+        target_kb_config = self.require_kb(tkb)
 
         target_repo = repo if tkb == source_kb else KBRepository(target_kb_config)
 
@@ -1898,9 +2341,13 @@ class KBService:
         if not resolved and not allow_dangling:
             raise EntryNotFoundError(f"Entry not found: {target_id}")
 
-        entry.add_link(target=target_id, relation=relation, note=note, kb=tkb)
-        entry.touch_updated_at()
-        self._doc_mgr.save_entry(entry, source_kb, kb_config)
+        # One appended item through the one write path (#955, B6 P4): the
+        # file's other keys keep their bytes, `updated_at` is stamped where
+        # the file carries it, and the publish is compare-and-replace under
+        # the momentary lock. The item is spelled as it always was (`kb:` is
+        # the target KB, the source's own included).
+        item = Link(target=target_id, relation=relation, note=note, kb=tkb).to_dict()
+        self.apply_operations(source_id, source_kb, [Append("links", item)])
         return {"resolved": resolved, "created": True, "relation": relation}
 
     def add_links(
@@ -1915,11 +2362,12 @@ class KBService:
         Targets are not required to exist: a bulk link set is often loaded
         before, or alongside, the entries it points at.
 
-        Each source is loaded once, gets all of its new links, and is saved
-        once through the same DocumentManager path :meth:`add_link` uses --
-        in place, wherever the file lives, and re-indexed. The CLI used to
-        ``repo.save`` it, which re-derived the path from the type and wrote a
-        second copy of any entry kept elsewhere (#375).
+        Each source is loaded once, gets all of its new links, and is written
+        once: one ``Append`` per new link through the same operation write
+        :meth:`add_link` uses (#955, B6 P4) -- in place, wherever the file
+        lives, the other keys' bytes untouched, and re-indexed. The CLI used
+        to ``repo.save`` it, which re-derived the path from the type and
+        wrote a second copy of any entry kept elsewhere (#375).
 
         Returns one result per spec, in input order:
         ``{"status": "created" | "skipped" | "failed", "error"?: str,
@@ -1935,6 +2383,7 @@ class KBService:
         results: list[dict[str, Any]] = [{} for _ in links]
         loaded: dict[str, Entry | None] = {}
         dirty: dict[str, list[int]] = {}
+        new_items: dict[str, list[dict[str, Any]]] = {}
 
         for i, spec in enumerate(links):
             try:
@@ -1959,7 +2408,11 @@ class KBService:
             ):
                 results[i] = {"status": "skipped"}
                 continue
-            entry.add_link(target=target_id, relation=relation, note=note, kb=tkb)
+            # The model's list is what the duplicate check above reads, so a
+            # second spec for the same link in this batch is skipped too.
+            link = Link(target=target_id, relation=relation, note=note, kb=tkb)
+            entry.links.append(link)
+            new_items.setdefault(source_id, []).append(link.to_dict())
             results[i] = {"status": "created"}
             dirty.setdefault(source_id, []).append(i)
 
@@ -1967,10 +2420,10 @@ class KBService:
             return results
 
         for source_id, positions in dirty.items():
-            entry = loaded[source_id]
             try:
-                entry.touch_updated_at()
-                self._doc_mgr.save_entry(entry, kb_name, kb_config)
+                self.apply_operations(
+                    source_id, kb_name, [Append("links", item) for item in new_items[source_id]]
+                )
             except Exception as e:
                 # Once per failed save, not once per position: one cause, one line.
                 message = _safe_message(e)
@@ -1996,8 +2449,7 @@ class KBService:
             target_kb=spec.get("target_kb"),
         )
         tkb = spec.get("target_kb") or kb_name
-        if self.config.get_kb(tkb) is None:
-            raise KBNotFoundError(f"KB not found: {tkb}")
+        self.require_kb(tkb)
         return source_id, target_id, relation, note, tkb
 
     # =========================================================================
@@ -2106,9 +2558,7 @@ class KBService:
         folder_path = metadata.get("folder_path", "") if isinstance(metadata, dict) else ""
         if not folder_path:
             return [], 0
-        kb_config = self.config.get_kb(kb_name)
-        if not kb_config:
-            raise KBNotFoundError(f"KB not found: {kb_name}")
+        kb_config = self.require_kb(kb_name)
         abs_folder = str(kb_config.path / folder_path)
         entries = self.db.list_entries_in_folder(
             kb_name, abs_folder, sort_by, sort_order, limit, offset
@@ -2340,24 +2790,15 @@ class KBService:
         Drawn only from the KBs the caller may read (`readable_kbs`, required;
         `UNSCOPED` is the caller for whom that is every KB) and capped: a name
         offered from outside that set would confirm a private KB exists. The
-        hint names no KB when nothing matches.
+        hint names no KB when nothing matches. The rule is the resolver's
+        (`kb_resolver.near_kb_names`, #952); this is what it says.
         """
-        import difflib
+        from .kb_resolver import HOW_TO_LIST_KBS, near_kb_names
 
-        names = sorted(
-            kb.name
-            for kb in self.config.all_kbs()
-            if readable_kbs is None or kb.name in readable_kbs
-        )
-        matches = (
-            difflib.get_close_matches(kb_name, names, n=self.KB_NAME_SUGGESTION_LIMIT)
-            if isinstance(kb_name, str)
-            else []
-        )
-        how = "Call orient with no KB name to list the KBs you can read."
+        matches = near_kb_names(self.config, kb_name, readable_kbs)
         if matches:
-            return matches, f"Did you mean: {', '.join(matches)}? {how}"
-        return [], how
+            return matches, f"Did you mean: {', '.join(matches)}? {HOW_TO_LIST_KBS}"
+        return [], HOW_TO_LIST_KBS
 
     def orient_overview(
         self,
@@ -2434,9 +2875,7 @@ class KBService:
         existing caller's response is unchanged.
         """
         detail = self._orient_detail(detail)
-        kb_config = self.config.get_kb(kb_name)
-        if not kb_config:
-            raise KBNotFoundError(f"KB '{kb_name}' not found")
+        kb_config = self.require_kb(kb_name)
 
         total = self.count_entries(kb_name=kb_name)
         distinct_types = self.get_distinct_types(kb_name=kb_name)
@@ -2493,6 +2932,15 @@ class KBService:
             "operational_contracts": self._operational_contracts(),
         }
 
+        # A KB type that belonged to an extension Pyrite has deleted (#953):
+        # said here, the first call an agent makes in a KB, and nowhere else
+        # but `index health`; the rule is `plugins/removed.py`'s.
+        from ..plugins.removed import removed_extension_notice
+
+        notice = removed_extension_notice(kb_name, kb_config.kb_type, distinct_types)
+        if notice:
+            result["notices"] = [notice]
+
         # Plugin orient supplements
         from ..plugins.registry import get_registry
 
@@ -2533,9 +2981,7 @@ class KBService:
 
     def generate_readme(self, kb_name: str) -> str:
         """Generate a README.md for a knowledge base."""
-        kb_config = self.config.get_kb(kb_name)
-        if not kb_config:
-            raise KBNotFoundError(f"KB not found: {kb_name}")
+        kb_config = self.require_kb(kb_name)
 
         description = kb_config.description or ""
         total = self.count_entries(kb_name=kb_name)
@@ -2673,9 +3119,7 @@ class KBService:
         ``KBNotFoundError`` for an unknown KB, ``EntryNotFoundError`` for an
         absent entry.
         """
-        kb_config = self.config.get_kb(kb_name)
-        if kb_config is None:
-            raise KBNotFoundError(f"KB not found: {kb_name}")
+        kb_config = self.require_kb(kb_name)
         if self.db.get_entry(entry_id, kb_name) is not None:
             return
         if KBRepository(kb_config).load(entry_id) is not None:
@@ -2871,9 +3315,7 @@ class KBService:
         Static subdirectories preserve deliberate placement, collection YAML files
         describe their containing folders, and filenames remain fixed at creation.
         """
-        kb_config = self.config.get_kb(kb_name)
-        if kb_config is None:
-            raise KBNotFoundError(f"KB not found: {kb_name}")
+        kb_config = self.require_kb(kb_name)
 
         repo = KBRepository(kb_config)
         planned: list[tuple[Entry, Path, Path]] = []
@@ -2987,9 +3429,7 @@ class KBService:
         """
         from ..services.git_service import GitService
 
-        kb_config = self.config.get_kb(kb_name)
-        if not kb_config:
-            raise KBNotFoundError(kb_name)
+        kb_config = self.require_kb(kb_name)
 
         kb_path = kb_config.path
         if not GitService.is_git_repo(kb_path):
@@ -3105,9 +3545,7 @@ class KBService:
         """
         from ..services.git_service import GitService
 
-        kb_config = self.config.get_kb(kb_name)
-        if not kb_config:
-            raise KBNotFoundError(kb_name)
+        kb_config = self.require_kb(kb_name)
 
         kb_path = kb_config.path
         if not GitService.is_git_repo(kb_path):
@@ -3180,6 +3618,189 @@ class KBService:
 # _CORE_HOOKS dict that used to live here is gone — runner.core_hooks(name) is
 # the inspection surface now.
 # =============================================================================
+
+
+#: One read-and-apply, then five more from a fresh read (ADR-0042 decision 10).
+_UPDATE_ATTEMPTS = 6
+
+
+#: The managed lists a surface may append an item to or remove one from, as
+#: a whole item (``links``, never ``links[0].x``).
+_ITEM_LISTS = frozenset({"links", "sources"})
+
+
+def _request_operations(updates: dict[str, Any]) -> list[Any]:
+    """The request's fields as operations, paths as sent: ``body`` a
+    ``ReplaceBody``, ``metadata: {k: v}`` one ``Set(("metadata", k))`` per
+    key, every other key a ``Set(key)``. ``_resolve_operation`` spells the
+    paths onto the file and decides the refusals."""
+    # A request path is parsed into segments once, here, at the boundary
+    # (`path_segments`: `.` and `[i]`, the one parser `apply()` uses). From
+    # here on a path is a tuple and no segment is read again, so an envelope
+    # key `status_change_log[0]` or `metadata.id` is the field it names, not
+    # a literal key the refusal never saw (#1001 review).
+    from ..schema.field_aliases import path_segments
+
+    ops: list[Any] = []
+    try:
+        for key, value in updates.items():
+            if key == "body":
+                ops.append(ReplaceBody(value if isinstance(value, str) else str(value)))
+            elif key == "metadata" and isinstance(value, dict):
+                ops += [Set(("metadata", *path_segments(mk)), mv) for mk, mv in value.items()]
+            else:
+                ops.append(Set(path_segments(key), value))
+    except ValueError as e:
+        raise ValidationError(f"Cannot read a field path in the update: {e}") from None
+    return ops
+
+
+def _item_operations(
+    append: dict[str, Any] | None, remove: dict[str, Any] | None, unset: list[str] | None
+) -> list[Any]:
+    """The surfaces' ``append``/``remove``/``unset`` as operations: a list
+    value under a key means each of its items; ``unset`` is a list of keys.
+    A wrong shape (``unset: "tags"``, ``append: ["tags", "x"]``) is refused
+    as a ``ValidationError``, so every surface answers ``VALIDATION_FAILED``
+    (#973 fix round 1: MCP iterated a string per character)."""
+
+    def mapping(name: str, value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict) or any(not isinstance(k, str) or not k for k in value):
+            raise ValidationError(
+                f"`{name}` must be an object of {{field: item}} (a list value means each "
+                f"item), got {type(value).__name__}."
+            )
+        return value
+
+    if unset is not None and (
+        not isinstance(unset, list) or any(not isinstance(k, str) or not k for k in unset)
+    ):
+        raise ValidationError(
+            f'`unset` must be a list of field names, e.g. ["tags"], got {unset!r}.'
+        )
+    from ..schema.field_aliases import path_segments
+
+    ops: list[Any] = []
+    try:
+        for key, value in mapping("append", append).items():
+            ops += [
+                Append(path_segments(key), item)
+                for item in (value if isinstance(value, list) else [value])
+            ]
+        for key, value in mapping("remove", remove).items():
+            ops += [
+                Remove(path_segments(key), item)
+                for item in (value if isinstance(value, list) else [value])
+            ]
+        for key in unset or []:
+            ops.append(Unset(path_segments(key)))
+    except ValueError as e:
+        raise ValidationError(f"Cannot read a field path in the operation: {e}") from None
+    return ops
+
+
+def _checked_item(entry: Entry, field: str, value: Any) -> Any:
+    """An item appended to ``links`` or ``sources``, checked as one before
+    anything is written: a mapping the item type reads (``Link.from_dict``,
+    ``Source.from_dict``), a link with a target the index can store
+    (``check_link_target``). A string or a list is refused here, never
+    written and then refused by the index insert (#973 fix round 1)."""
+    item_type = Link if field == "links" else Source
+    if not isinstance(value, dict):
+        raise ValidationError(
+            f"Cannot append to {field} on {entry.entry_type} '{entry.id}': an item is an "
+            f'object (for a link, {{"target": "<id>", "relation": "<relation>"}}), '
+            f"got {type(value).__name__}."
+        )
+    try:
+        item = item_type.from_dict(value)
+    except Exception as e:
+        raise ValidationError(
+            f"Cannot append to {field} on {entry.entry_type} '{entry.id}': {e}"
+        ) from e
+    if field == "links":
+        check_link_target(item.to_dict())
+    return value
+
+
+def _frontmatter_span(text: str) -> FrontmatterSpan:
+    split = split_frontmatter(text)
+    assert isinstance(split, Frontmatter), split  # apply() just produced it
+    return FrontmatterSpan(split.yaml_start, split.close_start, split.close_end)
+
+
+def _nested_block_is_all_equal_pairs(entry: Entry, file_values: dict[str, Any]) -> bool:
+    """True when the file's ``metadata:`` block holds only second spellings
+    of fields whose every spelling is the same YAML value: the block the
+    merge empties, which may then go whole (#1001 round 4, item 4)."""
+    from ..schema.field_aliases import double_spellings, values_identical
+
+    nested = file_values.get("metadata")
+    if not isinstance(nested, dict) or not nested:
+        return False
+    doubled = double_spellings(file_values, type(entry), entry.entry_type)
+    nested_fields = {field for field, paths in doubled.items() for p in paths if p[0] == "metadata"}
+    for key in nested:
+        if key not in nested_fields and not any(
+            p == ("metadata", key) for paths in doubled.values() for p in paths
+        ):
+            return False
+    for paths in doubled.values():
+        values = [_value_at(file_values, p) for p in paths]
+        if not all(values_identical(v, values[0]) for v in values):
+            return False
+    return True
+
+
+def _value_at(values: Any, path: tuple[Any, ...]) -> Any:
+    """The value a file's frontmatter holds at ``path`` (a key, or a key under
+    ``metadata:``), or None when the path is absent; a reading only, for
+    comparing two spellings of one field."""
+    node = values
+    for seg in path:
+        if isinstance(node, dict) and seg in node:
+            node = node[seg]
+        else:
+            return None
+    return node
+
+
+def _plain_value(value: Any) -> Any:
+    """``value`` as plain data the file can hold: an Enum its value, a Link or
+    Source its mapping, containers recursively; everything else as sent."""
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Link | Source):
+        return value.to_dict()
+    if isinstance(value, dict):
+        return {k: _plain_value(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_plain_value(v) for v in value]
+    return value
+
+
+#: The ``updated_at`` bookkeeping lives with the write path (rename stamps it
+#: too, #955 P4); kept under its old name for this module's callers.
+_updated_at_stamp = updated_at_stamp
+_raw_scalar = raw_scalar
+
+
+def _same_instant_as_file(file_values: dict[str, Any], path: Any, value: Any) -> bool:
+    """Is ``value`` the instant the file already holds at the timestamp key
+    ``path``, in another spelling? ``created_at: 2026-01-15`` loads as a
+    date; a read reports it and an echo sends it back as the datetime
+    ``parse_datetime`` makes of it. Equal instants are one value (ADR-0042
+    decision 3), so the key keeps its bytes and ``updated_at`` is not
+    stamped for it. Only the timestamp keys take this path: a title edited
+    from ``"2026-01-15"`` to ``"2026-01-15T00:00:00Z"`` is a change."""
+    key = path[0] if isinstance(path, tuple) and len(path) == 1 else path
+    if not isinstance(key, str) or key not in _TIMESTAMP_FIELDS or key not in file_values:
+        return False
+    old = _timestamp_instant(file_values[key])
+    new = _timestamp_instant(value)
+    return old is not None and new is not None and old == new
 
 
 def _as_field_type(entry: Entry, key: str, value: Any) -> Any:

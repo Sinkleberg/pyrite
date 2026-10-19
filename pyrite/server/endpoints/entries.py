@@ -9,10 +9,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ...config import PyriteConfig
 from ...exceptions import (
+    ConflictError,
     EntryNotFoundError,
-    KBNotFoundError,
     KBReadOnlyError,
     PyriteError,
+    StorageError,
     ValidationError,
 )
 from ...services.access_policy import KB, Action, AnyKB, ReadScope
@@ -544,11 +545,7 @@ def export_entries(
     """Export entries as JSON, Markdown, or CSV."""
     from ...formats import get_format_registry
 
-    if not svc.get_kb(kb):
-        raise HTTPException(
-            status_code=404,
-            detail={"code": "KB_NOT_FOUND", "message": f"KB '{kb}' not found"},
-        )
+    svc.require_kb(kb)  # the one resolver (#952); a blank name is refused as unnamed
 
     entries = svc.list_entries(kb_name=kb, entry_type=entry_type, limit=limit, offset=0)
 
@@ -610,11 +607,7 @@ async def import_entries(
     """Import entries from an uploaded file."""
     from ...formats.importers import get_importer_registry
 
-    if not svc.get_kb(kb):
-        raise HTTPException(
-            status_code=404,
-            detail={"code": "KB_NOT_FOUND", "message": f"KB '{kb}' not found"},
-        )
+    svc.require_kb(kb)  # the one resolver (#952); a blank name is refused as unnamed
 
     # Auto-detect format from filename
     fmt = format
@@ -809,7 +802,11 @@ def create_entry(
 
     try:
         written = svc.create(req.kb, spec, allow_undeclared=req.allow_undeclared)
-    except (KBNotFoundError, EntryNotFoundError) as e:
+    except EntryNotFoundError as e:
+        # A KBNotFoundError is never caught here: the write tier resolves the
+        # named KB before the handler runs (#952), and one that still arrives
+        # (a blank name is a ValidationError, below) carries the class code
+        # through the central handler (#610).
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": str(e)})
     except KBReadOnlyError as e:
         raise HTTPException(status_code=403, detail={"code": "READ_ONLY", "message": str(e)})
@@ -885,12 +882,24 @@ def update_entry(
 
     try:
         written = svc.update(entry_id, req.kb, updates)
-    except (KBNotFoundError, EntryNotFoundError) as e:
+    except EntryNotFoundError as e:
+        # A KBNotFoundError is never caught here: the write tier resolves the
+        # named KB before the handler runs (#952), and one that still arrives
+        # (a blank name is a ValidationError, below) carries the class code
+        # through the central handler (#610).
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": str(e)})
     except KBReadOnlyError as e:
         raise HTTPException(status_code=403, detail={"code": "READ_ONLY", "message": str(e)})
     except ValidationError as e:
         raise refusal_http(e)
+    except ConflictError as e:
+        raise HTTPException(status_code=409, detail={"code": "CONFLICT", "message": str(e)})
+    except StorageError:
+        # A storage fault on the write (a hard-linked file, the lock
+        # directory, a lock held too long) is the central handler's
+        # `STORAGE_ERROR` 500 with the class's public text, not a 400 that
+        # would show the path.
+        raise
     except (PyriteError, ValueError) as e:
         raise HTTPException(status_code=400, detail={"code": "UPDATE_FAILED", "message": str(e)})
 
@@ -905,6 +914,9 @@ def update_entry(
         warnings=written.warnings,
         ignored=ignored,
         unchanged=unchanged,
+        changed=written.changed,
+        locked=written.locked,
+        not_moved=written.not_moved,
     )
 
 
@@ -929,19 +941,41 @@ def patch_entry_field(
         except (ValueError, Exception):
             logger.warning("Worktree routing failed for PATCH, falling back to main")
 
-    updates = {body.field: body.value}
+    updates = {body.field: body.value} if body.op == "set" else {}
     try:
-        written = svc.update(entry_id, body.kb, updates)
-    except (KBNotFoundError, EntryNotFoundError) as e:
+        written = svc.update(
+            entry_id,
+            body.kb,
+            updates,
+            append={body.field: body.value} if body.op == "append" else None,
+            remove={body.field: body.value} if body.op == "remove" else None,
+            unset=[body.field] if body.op == "unset" else None,
+        )
+    except EntryNotFoundError as e:
+        # A KBNotFoundError is never caught here: the write tier resolves the
+        # named KB before the handler runs (#952), and one that still arrives
+        # (a blank name is a ValidationError, below) carries the class code
+        # through the central handler (#610).
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": str(e)})
     except KBReadOnlyError as e:
         raise HTTPException(status_code=403, detail={"code": "READ_ONLY", "message": str(e)})
     except ValidationError as e:
         raise refusal_http(e)
+    except ConflictError as e:
+        raise HTTPException(status_code=409, detail={"code": "CONFLICT", "message": str(e)})
+    except StorageError:
+        raise  # the central handler's STORAGE_ERROR 500, as on PUT
     except (PyriteError, ValueError) as e:
         raise HTTPException(status_code=400, detail={"code": "UPDATE_FAILED", "message": str(e)})
 
-    return UpdateResponse(updated=True, id=entry_id, warnings=written.warnings)
+    return UpdateResponse(
+        updated=True,
+        id=entry_id,
+        warnings=written.warnings,
+        changed=written.changed,
+        locked=written.locked,
+        not_moved=written.not_moved,
+    )
 
 
 @router.delete(
@@ -968,7 +1002,11 @@ def delete_entry(
 
     try:
         deleted = svc.delete_entry(entry_id, kb)
-    except (KBNotFoundError, EntryNotFoundError) as e:
+    except EntryNotFoundError as e:
+        # A KBNotFoundError is never caught here: the write tier resolves the
+        # named KB before the handler runs (#952), and one that still arrives
+        # (a blank name is a ValidationError, below) carries the class code
+        # through the central handler (#610).
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": str(e)})
     except KBReadOnlyError as e:
         raise HTTPException(status_code=403, detail={"code": "READ_ONLY", "message": str(e)})

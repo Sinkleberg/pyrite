@@ -1826,13 +1826,14 @@ def test_a_key_pyrite_cannot_name_is_refused_as_a_tagged_key_in_every_container(
         _refused(full, op, category="tagged key")
 
 
-def test_limit_a_tag_inside_a_set_members_value_is_not_seen():
-    """#769 item 2, a limit stated in the module doc: ruamel discards the
-    value of a set member, so the tagged key inside it cannot be detected.
-    The edit is applied elsewhere and the member's bytes are kept."""
+def test_a_tag_inside_a_set_members_value_is_refused_too():
+    """Was a stated limit (#769 item 2): ruamel discards the value of a set
+    member, so the loaded document never showed the tagged key inside it.
+    The guard now asks ruamel per key node (#972 round 1), so the key is
+    seen where it is written and the file is refused like any tagged key."""
     full = "---\ns: !!set {? a: {!!str k: 1}}\nb: 1\n---\nx\n"
-    after, _ = run(full, Set("b", 2))
-    assert after == full.replace("b: 1", "b: 2")
+    for op in [Set("b", 2), ReplaceBody("y")]:
+        _refused(full, op, category="tagged key")
 
 
 _SHAPE_REFUSALS = {
@@ -1858,17 +1859,6 @@ def test_every_frontmatter_shape_refusal_says_the_body_write_is_refused_too(name
     for op in _EVERY_OP:
         reason = _refused(full, op, category=category)
         assert "body" in reason, (name, op, reason)
-
-
-def test_a_key_item_with_no_key_is_refused_not_a_crash():
-    """#769 item 5: ruamel never loads an empty ``!!pairs`` item (it refuses
-    the document first), so no file reaches this; the guard is called as the
-    function it is, so a future loader change cannot turn it into a
-    ``ValueError`` from ``key, *rest = ()``."""
-    from pyrite.storage.file_operations import _loaded_tagged_key
-
-    with pytest.raises(OperationRefusedError):
-        _loaded_tagged_key((), set())
 
 
 @pytest.mark.control(

@@ -4,7 +4,7 @@ Pydantic models for the pyrite REST API.
 Extracted from api.py to reduce file size and improve organization.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -390,6 +390,15 @@ class UpdateResponse(BaseModel):
     #: the response by field name sees no shape change.
     ignored: list[str] = []
     unchanged: list[str] = []
+    #: ADR-0042 (#955). `changed` is false when the request changed nothing
+    #: and nothing was written; `locked` is false when the KB is outside git
+    #: and the file was replaced with compare-before-replace and no lock;
+    #: `not_moved` says why a templated-folder field left an unpinned file in
+    #: place. Defaults are the usual case, so an existing caller sees no
+    #: shape change.
+    changed: bool = True
+    locked: bool = True
+    not_moved: str | None = None
 
 
 class DeleteResponse(BaseModel):
@@ -397,28 +406,6 @@ class DeleteResponse(BaseModel):
 
     deleted: bool
     id: str
-
-
-class SiteCacheSyncStatus(BaseModel):
-    """Outcome of the site-cache render `wait=true` triggers alongside a sync.
-
-    Independent of the sync's own success (#349's cold-read round): a sync
-    that added, updated or removed entries has already committed by the time
-    the render runs, so a render failure is reported here rather than
-    failing the whole request. ``error`` is a generic message for callers;
-    the real exception and its traceback go to the server log only.
-
-    ``rendered`` means the render ran to completion (#408); it says nothing
-    about whether every page came out clean. ``errors`` is always present --
-    it is 0 when the render didn't get far enough to produce per-entry stats
-    (e.g. the service failed to construct) and the count of per-entry
-    failures otherwise -- so a caller reads ``rendered and errors == 0`` as
-    "all pages are fresh."
-    """
-
-    rendered: bool
-    errors: int = 0
-    error: str | None = None
 
 
 class SyncResponse(BaseModel):
@@ -429,7 +416,6 @@ class SyncResponse(BaseModel):
     updated: int
     removed: int
     skipped: list[dict[str, str]] = Field(default_factory=list)
-    site_cache: SiteCacheSyncStatus | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -474,11 +460,18 @@ class UpdateEntryRequest(BaseModel):
 
 
 class PatchEntryRequest(BaseModel):
-    """Request to update a single field on an entry."""
+    """Request to update a single field on an entry.
+
+    ``op`` is ``set`` (the default: ``value`` replaces the field; ``null`` is a
+    value), ``append`` or ``remove`` (``value`` is one item of the list
+    ``field``, or a list of items), or ``unset`` (the key is removed with its
+    own lines; ``value`` is ignored). ADR-0042 decision 1; #955, B6 P3b.
+    """
 
     kb: str
     field: str
-    value: str
+    value: Any = None
+    op: Literal["set", "append", "remove", "unset"] = "set"
 
 
 class EntryListResponse(BaseModel):

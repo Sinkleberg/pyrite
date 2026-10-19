@@ -41,7 +41,7 @@ from ..services.kb_service import KBService
 from ..utils.errors import PyriteCLIGroup, cli_error, exit_unless_whole
 from .browse_commands import register_browse_commands
 from .collection_commands import collections_app
-from .context import cli_context, get_config_and_db, open_index_db
+from .context import cli_context, get_config_and_db, open_index_db, require_kb
 from .db_commands import db_app
 from .entry_commands import register_entry_commands
 from .export_commands import export_app
@@ -275,8 +275,9 @@ def ci_command(
     # and validating nothing is not a pass (#795).
     config, db = get_config_and_db(config)
     try:
-        if kb and config.get_kb(kb) is None:
-            cli_error_from(KBNotFoundError(f"KB '{kb}' is not configured"), output_format)
+        # The one resolver (#952, #924): an unknown name or a shortname is
+        # KB_NOT_FOUND with its hint, the same as every other command.
+        require_kb(config, kb, db=db, output_format=output_format)
 
         # Handle no KBs configured
         if not config.knowledge_bases:
@@ -758,7 +759,7 @@ def _mcp_command_help() -> str:
     per tier, so this can't drift the way two fixed enumerations already
     have: a hardcoded "8 read tools" once drifted to 29 as orient/batch_read/
     task_* etc. were added; then 29/11/8 (core tools only) drifted from the
-    live count once plugins (sw_*, investigation_*, cascade_*, zettel_*,
+    live count once plugins (sw_*, investigation_*, zettel_*,
     wiki_*, social_*) started exposing 41+ tools at read tier alone (#229).
     Mirrors how PyriteMCPServer.__init__ assembles self.tools, without
     constructing a full server (no DB/config needed for --help text)."""
@@ -772,7 +773,7 @@ def _mcp_command_help() -> str:
         "exposed (counts include plugin tools registered for that tier):\n\n"
         f"- read: {read_total} tools (kb_orient, kb_search, kb_get, "
         "kb_timeline, kb_backlinks, kb_tags, kb_stats, kb_schema, task_*, "
-        "sw_*/investigation_*/cascade_* and other plugin tools, and more)\n"
+        "sw_*/investigation_* and other plugin tools, and more)\n"
         f"- write: read tier + {write_total - read_total} more (kb_create, "
         "kb_update, kb_delete, kb_link, task_claim, and more)\n"
         f"- admin: write tier + {admin_total - write_total} more (kb_registry_*, "
@@ -915,7 +916,7 @@ def import_entries(
         line.append(f": {title}: {r.get('error', 'unknown error')}")
         return line
 
-    with cli_context() as (config, db, svc):
+    with cli_context(kbs=(kb_name,), output_format=fmt) as (config, db, svc):
         try:
             results = svc.bulk_create_entries(
                 kb_name, parsed, allow_undeclared=allow_undeclared, validate_only=dry_run
@@ -979,7 +980,7 @@ def generate_readme_cmd(
     write: bool = typer.Option(False, "--write", "-w", help="Write to KB's README.md"),
 ):
     """Generate a README.md for a knowledge base."""
-    with cli_context() as (config, db, svc):
+    with cli_context(kbs=(kb_name,), output_format="rich") as (config, db, svc):
         try:
             readme = svc.generate_readme(kb_name)
         except PyriteError as e:

@@ -20,6 +20,7 @@ from ..config import PyriteConfig, load_config
 from ..exceptions import (
     BrandingInvalidError,
     ConfigError,
+    ConflictError,
     EntryNotFoundError,
     InvalidGitRefError,
     KBNotFoundError,
@@ -55,7 +56,7 @@ MAX_BATCH_READ_ENTRIES = 50
 #: Arguments of kb_create / kb_update that steer the tool, never entry fields.
 _CREATE_CONTROL_KEYS = frozenset({"kb_name", "validate", "allow_undeclared"})
 #: Arguments of kb_update that name the entry or steer the tool.
-_UPDATE_CONTROL_KEYS = frozenset({"entry_id", "kb_name", "validate"})
+_UPDATE_CONTROL_KEYS = frozenset({"entry_id", "kb_name", "validate", "append", "remove", "unset"})
 
 
 # Identity fields every `fields` projection keeps. Agents key on these to
@@ -222,6 +223,16 @@ def _error(
     return r
 
 
+def _with_old_kb_update_code(refusal: dict) -> dict:
+    """``kb_update``'s ``legacy_error_code`` for a class its old handler never
+    named: ``UPDATE_FAILED``, the one code it answered every such failure
+    with (its ``except PyriteError`` catch-all), kept one release (ADR-0037
+    theme 2). ``_refusal`` alone would carry the module-wide fallback
+    ``REQUEST_REFUSED``, a code ``kb_update`` never gave (#990)."""
+    refusal["legacy_error_code"] = "UPDATE_FAILED"
+    return refusal
+
+
 def _refusal(exc: PyriteError, *, already_logged: bool = False) -> dict:
     """Map a service refusal to the MCP envelope.
 
@@ -241,16 +252,19 @@ def _refusal(exc: PyriteError, *, already_logged: bool = False) -> dict:
     agreed on gets no ``legacy_error_code`` key at all -- there is nothing
     legacy to report.
 
-    Not retryable -- the same call fails the same way -- except a
-    ``StorageError`` that says otherwise: a locked or busy database
-    (``StorageBusyError``) can succeed on a retry; schema drift, a missing
-    table and corruption cannot (#431).
+    Not retryable -- the same call fails the same way -- except a class
+    that says otherwise: a locked or busy database (``StorageBusyError``)
+    and a write that lost the race for its file (``ConflictError``, #955)
+    can succeed on a retry; schema drift, a missing table and corruption
+    cannot (#431).
     """
     code = exc.error_code
     legacy_code = _legacy_mcp_code(exc)
     if legacy_code == code:
         legacy_code = None
-    retryable = isinstance(exc, StorageError) and exc.retryable
+    # A class that says it is retryable (a busy database, a write that lost
+    # the race for its file and asks for a re-read) is reported so.
+    retryable = bool(getattr(exc, "retryable", False))
     # str(exc) is safe for every existing domain error here -- validation
     # messages, "not found", query syntax -- except one that opts out via a
     # `public_message` class attribute because its own str() names a real
@@ -398,41 +412,28 @@ def _only_readable(rows: list[dict], readable_kbs: set[str] | None) -> list[dict
     return [r for r in rows if r.get("kb_name") in readable_kbs]
 
 
-#: The way forward in the dispatcher's refusal. One static string for an absent
-#: and an unreadable name alike, naming no KB: a near match here would be drawn
-#: from outside the caller's readable set or confirm what is inside it.
-_KB_NOT_FOUND_HINT = "Call kb_orient with no kb_name to list the KBs you can read."
+def _kb_refusal(svc: KBService, kb_name: object, readable_kbs: set[str] | None) -> dict | None:
+    """The refusal for a KB name the resolver refuses, or None when it is a
+    KB the caller may read (or names no KB).
 
-
-def _kb_not_found(kb_name: str) -> dict:
-    """The refusal for a KB the caller may not read.
-
-    Deliberately **not** a "forbidden": a private KB's existence is itself
-    private, so a caller must not be able to tell "you may not read this"
-    from "there is no such KB" and probe for which private KBs exist. This is
-    the MCP spelling of `api.kb_not_found`, whose REST counterpart 404s with
-    the same `KB_NOT_FOUND` for the same reason.
-
-    **Why the two answers cannot diverge for one caller.** Every refusal for
-    a scoped caller comes from this function: `_dispatch_tool`, the prompt
-    dispatcher and the resource reader call it for *any* KB name outside the
-    readable set, absent or private alike, before a handler runs. The
-    readable set holds only KBs that exist (`AccessPolicy.kbs_at_tier` walks
-    `config.all_kbs()`), so a handler's own not-found answer (`_kb_schema`
-    and others still say `NOT_FOUND`; `_kb_orient` adds a suggestion) is only
-    ever given for a name the caller was allowed to read. Those handler
-    answers therefore need not match this one byte for byte, and no longer
-    do. `tests/test_orient_is_true_as_the_first_call.py` walks every tool.
-
-    The code was `NOT_FOUND` until 0.25.7 (#66); it is carried in
-    `legacy_error_code` for one release (ADR-0037 theme 2).
+    The one resolver (`services/kb_resolver.py`, #952), asked through
+    `KBService.resolve_kb` for **every** caller and every KB a call names,
+    by the three chokepoints KB content passes through: `_dispatch_tool`,
+    `_get_prompt` and `_read_resource`. An absent name, a KB outside the
+    caller's readable set and a shortname (link syntax only) are one
+    `KBNotFoundError` -- deliberately not a "forbidden": a private KB's
+    existence is itself private, so a caller cannot tell "you may not read
+    this" from "there is no such KB". The envelope is `_refusal`'s: the class
+    code `KB_NOT_FOUND`, the resolver's suggestion, `did_you_mean` and the
+    old `NOT_FOUND` in `legacy_error_code` for one release (#66, ADR-0037
+    theme 2). A handler's own not-found answer is only ever reached for a
+    name the caller may read.
     """
-    return _error(
-        "KB_NOT_FOUND",
-        f"KB '{kb_name}' not found",
-        suggestion=_KB_NOT_FOUND_HINT,
-        legacy_error_code="NOT_FOUND",
-    )
+    try:
+        svc.resolve_kb(kb_name, readable_kbs=readable_kbs)
+    except KBNotFoundError as e:
+        return _refusal(e)
+    return None
 
 
 class PyriteMCPServer:
@@ -734,13 +735,12 @@ class PyriteMCPServer:
         body_offset = args.get("body_offset", 0)
         body_limit = args.get("body_limit")
 
-        # The same lookup `get_entry` reads through (shortname mapping, then
-        # config and the index's registry), not the startup config alone: a
-        # KB `pyrite kb add` registered while this server runs is served by
-        # kb_list_entries and kb_read_body, so it must not be KB_NOT_FOUND here.
-        named = named_kb(kb_name)
-        if named and self.svc.get_kb(self.config.kb_name_for(named)) is None:
-            return _refusal(KBNotFoundError(f"KB not found: {kb_name}"))
+        # `kb_name` has already been through the one resolver in
+        # `_dispatch_tool` (#952): an unknown name, a KB outside the caller's
+        # readable set and a shortname were refused before this ran, and a KB
+        # `pyrite kb add` registered while this server runs was found there
+        # through the index's registry (#764, #925), so it is served here as
+        # kb_list_entries and kb_read_body serve it.
 
         # Scoped lookup: without `kb_name` it walks only readable KBs, so a
         # private entry neither answers nor shadows a readable twin (P-R5),
@@ -1110,25 +1110,10 @@ class PyriteMCPServer:
                     offset=args.get("offset", 0),
                 )
             return self.svc.orient(kb_name, recent_limit=args.get("recent_limit", 5), detail=detail)
-        except KBNotFoundError as e:
-            # A scoped caller is refused by the dispatcher before this for any
-            # name outside its readable set, so this is reached with the name
-            # of a KB the caller could have read. The near matches are drawn
-            # from the readable set all the same.
-            names, hint = self.svc.kb_name_suggestions(kb_name, readable_kbs=readable_kbs)
-            # This handler reported OPERATION_FAILED, not the NOT_FOUND
-            # `_refusal` would replay for the class, so the old code is given
-            # here. One release (ADR-0037 theme 2); remove with the rest.
-            return {
-                **_error(
-                    e.error_code,
-                    _safe_message(e),
-                    suggestion=hint,
-                    legacy_error_code="OPERATION_FAILED",
-                ),
-                "did_you_mean": names,
-            }
         except PyriteError as e:
+            # A name the resolver refuses never reaches this handler: the
+            # dispatcher answers it, with `did_you_mean` and the suggestion,
+            # for every caller (#952).
             return _refusal(e)
 
     def _kb_recent(
@@ -1449,9 +1434,27 @@ class PyriteMCPServer:
         )
 
         try:
-            written = self.svc.update(entry_id, kb_name, updates)
+            written = self.svc.update(
+                entry_id,
+                kb_name,
+                updates,
+                append=args.get("append"),
+                remove=args.get("remove"),
+                unset=args.get("unset"),
+            )
         except ValidationError as e:
             return _refusal(e)
+        except ConflictError as e:
+            # A write that lost the race for its file (#955): the class's
+            # own code, with the old code this handler gave everything it
+            # did not name (ADR-0037, one release).
+            return _with_old_kb_update_code(_refusal(e))
+        except StorageError as e:
+            # A storage fault on the write (a hard-linked file, the lock
+            # directory, a lock held too long): the class's own code and
+            # `retryable`, its public text, the detail logged once (#431).
+            logger.error("Tool kb_update failed: %s", e, exc_info=e)
+            return _with_old_kb_update_code(_refusal(e, already_logged=True))
         except (EntryNotFoundError, KBNotFoundError) as e:
             # Keep the old handler-level spelling for one release while the
             # class code becomes the primary contract (ADR-0037).
@@ -1467,6 +1470,15 @@ class PyriteMCPServer:
             "entry_id": entry.id,
             "file_path": str(entry.file_path) if entry.file_path else "",
         }
+        # ADR-0042 (#955): said only when not the usual: a request that
+        # changed nothing wrote nothing; a KB outside git was written with
+        # no lock; a templated-folder field did not move an unpinned file.
+        if not written.changed:
+            result["changed"] = False
+        if not written.locked:
+            result["locked"] = False
+        if written.not_moved:
+            result["not_moved"] = written.not_moved
         if ignored:
             result["ignored"] = ignored
         if unchanged:
@@ -2132,10 +2144,10 @@ class PyriteMCPServer:
         handler = handlers.get(name)
         if not handler:
             return _error("OPERATION_FAILED", f"Unknown prompt: {name}")
-        if readable_kbs is not None:
-            for kb_name in _kbs_named_in(arguments):
-                if kb_name not in readable_kbs:
-                    return _kb_not_found(kb_name)
+        for kb_name in _kbs_named_in(arguments):
+            refusal = _kb_refusal(self.svc, kb_name, readable_kbs)
+            if refusal is not None:
+                return refusal
         import inspect
 
         try:
@@ -2384,8 +2396,9 @@ class PyriteMCPServer:
             and "/entries/" not in uri
         ):
             kb_name = uri[len(f"{URI_SCHEME}kbs/") : -len("/entries")]
-            if readable_kbs is not None and kb_name not in readable_kbs:
-                return _kb_not_found(kb_name)
+            refusal = _kb_refusal(self.svc, kb_name, readable_kbs)
+            if refusal is not None:
+                return refusal
             entries = self.svc.list_entries(kb_name=kb_name, limit=MAX_RESOURCE_LIST_ENTRIES)
             return {
                 "contents": [
@@ -2405,10 +2418,9 @@ class PyriteMCPServer:
             entry_kb, _, entry_id = uri[len(f"{URI_SCHEME}kbs/") :].partition("/entries/")
             # A KB the caller cannot read and a KB that does not exist answer
             # the same KB_NOT_FOUND (scoped or not), never a plain NOT_FOUND.
-            if (readable_kbs is not None and entry_kb not in readable_kbs) or self.svc.get_kb(
-                entry_kb
-            ) is None:
-                return _kb_not_found(entry_kb)
+            refusal = _kb_refusal(self.svc, entry_kb, readable_kbs)
+            if refusal is not None:
+                return refusal
         if entry_id is not None:
             # Without a KB the lookup is bounded by the caller's readable set:
             # an entry in a private KB is a plain miss (naming the KB would
@@ -2545,14 +2557,23 @@ class PyriteMCPServer:
                     retryable=True,
                 )
 
-        # Per-KB read scoping. Checked before the handler runs, and for
-        # EVERY KB the call names -- naming a readable KB alongside a
-        # private one must buy nothing.
-        named_kbs = _kbs_named_in(arguments) if readable_kbs is not None else []
-        if readable_kbs is not None:
-            for kb_name in named_kbs:
-                if kb_name not in readable_kbs:
-                    return _kb_not_found(kb_name)
+        # Every KB the call names goes through the one resolver (#952),
+        # for every caller: an unknown name, a KB outside a scoped caller's
+        # readable set and a shortname are refused before the handler runs,
+        # and for EVERY name -- naming a readable KB alongside a private one
+        # must buy nothing.
+        named_kbs = _kbs_named_in(arguments)
+        for kb_name in named_kbs:
+            refusal = _kb_refusal(self.svc, kb_name, readable_kbs)
+            if refusal is not None:
+                if name == "kb_update" and readable_kbs is None:
+                    # The one refusal, with the old code the old algorithm
+                    # gave this caller: an unscoped kb_update reached its
+                    # handler, which answered a missing KB with UPDATE_FAILED
+                    # until 0.25.8 (#761, #981); a scoped caller was refused
+                    # here, with NOT_FOUND, as every other tool still is.
+                    refusal["legacy_error_code"] = "UPDATE_FAILED"
+                return refusal
 
         takes_readable = readable_kbs is not None and self._handler_takes_readable_kbs(name)
 

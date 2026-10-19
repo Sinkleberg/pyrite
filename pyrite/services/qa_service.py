@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from ..config import PyriteConfig
@@ -110,26 +111,29 @@ class QAService:
         )
 
         if not rows:
-            return {
-                "entry_id": entry_id,
-                "kb_name": kb_name,
-                "issues": [
-                    {
-                        "entry_id": entry_id,
-                        "kb_name": kb_name,
-                        "rule": "entry_not_found",
-                        "severity": "error",
-                        "field": "id",
-                        "message": f"Entry '{entry_id}' not found in KB '{kb_name}'",
-                    }
-                ],
-            }
+            issues.append(
+                {
+                    "entry_id": entry_id,
+                    "kb_name": kb_name,
+                    "rule": "entry_not_found",
+                    "severity": "error",
+                    "field": "id",
+                    "message": f"Entry '{entry_id}' not found in KB '{kb_name}'",
+                }
+            )
+            # A file whose frontmatter Pyrite cannot model never reaches the
+            # index (a tagged or complex key is no JSON key), so the one
+            # check that explains why reads its file (#760 (b)).
+            if self._kb_folder_problem(kb_name) is None:
+                self._check_unmodellable_frontmatter(issues, kb_name, entry_id=entry_id)
+            return {"entry_id": entry_id, "kb_name": kb_name, "issues": issues}
 
         entry = rows[0]
         self._check_entry_fields(entry, issues)
         self._check_entry_links(entry_id, kb_name, issues, readable_kbs=readable_kbs)
         # The checks below read the KB's folder (its files, its kb.yaml).
         if not self._report_unreadable_kb(issues, kb_name):
+            self._check_unmodellable_frontmatter(issues, kb_name, entry_id=entry_id)
             sources = self._check_file_values(issues, kb_name, entry_id=entry_id)
             self._check_schema_validation(entry, issues, sources.get(entry_id))
             self._check_rubric_evaluation(entry, issues)
@@ -181,6 +185,9 @@ class QAService:
         # folder that is missing or unreadable is one error for the KB, and
         # those checks are skipped, never passed or crashed (#950 round 2).
         if not self._report_unreadable_kb(issues, kb_name, tier=tier):
+            # Files whose frontmatter Pyrite cannot model (#760 (b)): no write
+            # reaches them, so say so here with the line, as index health does.
+            self._check_unmodellable_frontmatter(issues, kb_name)
             # Per-file pass: what the index cannot show, because it keeps only
             # Pyrite's reading -- reserved keys the KB uses for fields of its own
             # (#557), a task priority read from a word (#554)
@@ -249,7 +256,6 @@ class QAService:
         Names no path: the message can reach an MCP or REST caller.
         """
         import os
-        from pathlib import Path
 
         kb_config = self.config.get_kb(kb_name)
         if kb_config is None:
@@ -1054,6 +1060,80 @@ class QAService:
     # Reserved-key pass (reads the files)
     # =========================================================================
 
+    def _check_unmodellable_frontmatter(
+        self, issues: list[dict[str, Any]], kb_name: str, *, entry_id: str | None = None
+    ) -> None:
+        """One issue per file whose frontmatter ``apply()`` cannot model (a
+        tagged, complex or duplicate key), with the line and the reason: the
+        same walk ``index health`` reports (``storage.index.unmodellable_files``),
+        on every file of the KB or on ``entry_id``'s file alone. A warning,
+        as it is to ``index health``: the file reads; no write reaches it."""
+        from ..storage.index import unmodellable_files
+        from ..storage.repository import KBRepository
+
+        kb_config = self.config.get_kb(kb_name)
+        if kb_config is None:
+            return
+        if entry_id is None:
+            rows = unmodellable_files(kb_config)
+        else:
+            only = KBRepository(kb_config).find_file(entry_id)
+            # A file no lookup can read (a duplicate key) is found by no id;
+            # the KB walk lists it under its stem, so the one-entry report
+            # takes the KB walk's own rows for that id and the two agree.
+            rows = (
+                unmodellable_files(kb_config, [only])
+                if only is not None
+                else [row for row in unmodellable_files(kb_config) if row["id"] == entry_id]
+            )
+        for row in rows:
+            issues.append(
+                {
+                    "entry_id": row["id"],
+                    "kb_name": kb_name,
+                    "rule": "frontmatter_unmodellable",
+                    "severity": "warning",
+                    "field": "frontmatter",
+                    "path": row["path"],
+                    "line": row["line"],
+                    "message": (
+                        f"frontmatter Pyrite cannot model at line {row['line']}: "
+                        f"{row['reason']}. No update reaches this file; fix the key by hand."
+                    ),
+                }
+            )
+
+    @staticmethod
+    def _check_double_spellings(
+        issues: list[dict[str, Any]], kb_name: str, entry: Any, shown: Any
+    ) -> None:
+        """One issue per field the file spells twice (`k:` and `metadata.k`,
+        or a field and its alias): the reader believes the top-level spelling
+        and no update reaches the field until one spelling is removed
+        (Andon #994, decision A: `metadata.k` is a second spelling of `k`)."""
+        from ..schema.field_aliases import double_spellings
+
+        source = getattr(entry, "_source_frontmatter", None)
+        if not isinstance(source, dict):
+            return
+        for field_name, paths in double_spellings(source, type(entry), entry.entry_type).items():
+            spelled = ", ".join("`" + ".".join(p) + "`" for p in paths)
+            issues.append(
+                {
+                    "entry_id": entry.id,
+                    "kb_name": kb_name,
+                    "rule": "field_spelled_twice",
+                    "severity": "warning",
+                    "field": field_name,
+                    "path": str(shown),
+                    "message": (
+                        f"Entry '{entry.id}' spells '{field_name}' twice ({spelled}); the "
+                        "top-level spelling is read and no update reaches the field. "
+                        "Remove one spelling by hand."
+                    ),
+                }
+            )
+
     def _check_file_values(
         self, issues: list[dict[str, Any]], kb_name: str, *, entry_id: str | None = None
     ) -> dict[str, dict[str, Any]]:
@@ -1064,7 +1144,6 @@ class QAService:
         Returns each loaded entry's own frontmatter by id, for the schema
         pass to read typed attributes as the file wrote them.
         """
-        from pathlib import Path
 
         from ..storage.repository import KBRepository
         from ..utils.frontmatter import leaked_frontmatter_line
@@ -1110,6 +1189,7 @@ class QAService:
                 shown = file_path
             self._check_reserved_key_collisions(issues, kb_name, entry, shown)
             self._check_task_priority(issues, kb_name, entry, shown)
+            self._check_double_spellings(issues, kb_name, entry, shown)
             if entry._source_frontmatter is not None:
                 leaked = leaked_frontmatter_line(entry._source_frontmatter, entry.body or "")
                 if leaked is not None:
@@ -1219,11 +1299,13 @@ class QAService:
         at load (#704) and is not reported here. The path in the message is the
         handle to use: no index row exists for such a file.
         """
-        from ..exceptions import FrontmatterError
+        from ..storage.repository import _is_regular_file
         from ..utils.frontmatter import Frontmatter, split_frontmatter
         from ..utils.yaml import load_yaml
 
         for file_path in repo.list_files():
+            if not _is_regular_file(file_path):
+                continue  # a FIFO would block the read (#972; the dev-to-arch merge, #1026)
             try:
                 text = file_path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
@@ -1233,11 +1315,15 @@ class QAService:
                 continue
             try:
                 fm = load_yaml(split.text)
-            except FrontmatterError:
-                # Frontmatter that will not parse (`title: [a, b`) has no title
-                # to judge, and the malformed-file rule already reports it. Left
-                # unhandled it aborts the whole KB-wide pass over one bad file,
-                # so the rest of the KB goes unreported.
+            except Exception:  # noqa: BLE001 - every way a document fails to load
+                # Frontmatter that will not parse or construct (`title: [a, b`,
+                # a `2024-02-30:` key, `!!float abc`, 800 nested brackets) has
+                # no title to judge, and the reader's malformed-file row already
+                # reports it (#760). `load_yaml` turns a YAML error into a
+                # `FrontmatterError`, but a constructor failure is a
+                # `ValueError`, a `TypeError` or a `RecursionError`; left
+                # unhandled any of them aborts the whole KB-wide pass over one
+                # bad file, so the rest of the KB goes unreported (#1026).
                 logger.debug("non-string title check: skipping %s", file_path, exc_info=True)
                 continue
             if not isinstance(fm, dict) or "title" not in fm:

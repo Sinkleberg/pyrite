@@ -144,7 +144,7 @@ class AmbiguousEntryError(PyriteError):
 #: CLI by naming it here. Not every extra goes through it yet:
 #: ``UndeclaredTypeError.declared_types`` is still copied by MCP's ``_refusal``
 #: and REST's write-refusal path themselves, with their own suggestion text.
-REFUSAL_FIELDS: tuple[str, ...] = ("candidate_kbs",)
+REFUSAL_FIELDS: tuple[str, ...] = ("candidate_kbs", "did_you_mean")
 
 
 def refusal_fields(exc: BaseException) -> dict:
@@ -158,9 +158,33 @@ def refusal_fields(exc: BaseException) -> dict:
 
 
 class KBNotFoundError(PyriteError):
-    """Raised when a knowledge base cannot be found."""
+    """Raised when a knowledge base cannot be found.
+
+    The one refusal for a KB name that is unknown, that the caller may not
+    read (the same answer, ADR-0037 §4), or that is a shortname outside link
+    syntax (#952). ``services/kb_resolver.py`` raises it with a
+    ``suggestion`` and ``did_you_mean`` (near matches from the KBs the caller
+    may read; the full name for a readable KB's shortname), which every
+    transport copies into its body through ``refusal_fields``. Raised bare
+    (message only) elsewhere, it carries neither.
+    """
 
     error_code = "KB_NOT_FOUND"
+    suggestion: str | None = None
+    did_you_mean: list[str] | None = None
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        suggestion: str | None = None,
+        did_you_mean: list[str] | None = None,
+    ):
+        super().__init__(message)
+        if suggestion is not None:
+            self.suggestion = suggestion
+        if did_you_mean is not None:
+            self.did_you_mean = list(did_you_mean)
 
 
 class KBReadOnlyError(PyriteError):
@@ -367,6 +391,22 @@ class StorageBusyError(StorageError):
     retryable = True
 
 
+class ConflictError(PyriteError):
+    """A write lost the race for its file and nothing was written (ADR-0042
+    decision 10, #955).
+
+    The update re-reads the file and re-applies its operations when the file
+    changed between its read and its replace (``FileChanged``), at most five
+    times; a file that keeps changing is this. Safe to show: the message
+    names the entry and the KB, never a path. REST answers 409 (the
+    ``CONFLICT`` row), MCP ``CONFLICT`` with ``retryable``, the CLI its
+    refusal shape with the same code.
+    """
+
+    error_code = "CONFLICT"
+    retryable = True
+
+
 class KBProtectedError(PyriteError):
     """Raised when attempting to modify/remove a config-protected KB."""
 
@@ -401,10 +441,10 @@ class BrandingInvalidError(PyriteError):
 
     ``str()`` names the real branding.yaml path and the parser's own text --
     useful in the server log, not safe to return over HTTP or MCP: every
-    caller of ``BrandingService`` runs on an anonymous, always-public path
-    (``/config/branding``, ``/sitemap.xml``, ``/robots.txt``, the MCP
-    ``research_topic`` prompt), not just the admin-only render endpoint
-    (#445's cold read). ``public_message`` is safe to show; it names neither.
+    caller of ``BrandingService`` runs on an anonymous or always-public
+    path (``/config/branding``, the MCP ``research_topic`` prompt, the KB
+    README footer), with no admin in the loop (#445's cold read).
+    ``public_message`` is safe to show; it names neither.
     """
 
     error_code = "BRANDING_INVALID"

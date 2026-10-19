@@ -32,6 +32,7 @@ RESERVED_FIELD_NAMES: frozenset[str] = frozenset(
         "_absent_default_keys",
         "_source_frontmatter",
         "_nested_metadata_keys",
+        "_shadowed_nested",
         "_raw_metadata",
         "_unparsed_timestamp_keys",
         "_unrepresented_keys",

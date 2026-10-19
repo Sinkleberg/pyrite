@@ -69,8 +69,12 @@ pyrite update hello-agent -k notes --body "Second note."
 
 <!-- output-keys -->
 ```json
-{"updated": true, "entry_id": "hello-agent", "outcome": "done"}
+{"updated": true, "entry_id": "hello-agent", "outcome": "done", "locked": false}
 ```
+
+`locked: false` says this KB is not a git work tree: the write compared the
+file with what it read and replaced it, with no lock (two writers can both
+pass that compare). Inside git the key is absent, which means `true`.
 
 A field the type does not declare is stored under `metadata`, not at the top
 level of the entry:
@@ -149,7 +153,7 @@ pyrite update hello-agent -k nokb --title x
 
 <!-- output-keys -->
 ```json
-{"outcome": "error", "error": "KB not found: nokb", "error_code": "KB_NOT_FOUND", "retryable": false}
+{"outcome": "error", "error": "KB 'nokb' not found", "error_code": "KB_NOT_FOUND", "retryable": false, "suggestion": "To list the KBs you can read, call kb_orient (MCP) or `pyrite orient` (CLI) with no KB name.", "did_you_mean": []}
 ```
 
 ## Not covered here

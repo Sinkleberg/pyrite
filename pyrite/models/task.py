@@ -494,6 +494,12 @@ class TaskEntry(Assignable, Temporal, Statusable, Prioritizable, Parentable, Not
     # is supplied, so the *why* of a transition lives with the task rather than
     # only in git history.
     status_change_log: list[dict[str, Any]] = field(default_factory=list)
+    # The nested value of a key the source spells twice (`rank: 1` and
+    # `metadata: {rank: 2}`): read at the top level, kept here, written back
+    # under `metadata:` so a save loses nothing (#1001, decision 4).
+    _shadowed_nested: dict[str, Any] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     #: Written by TaskService (claim, checkpoint, transitions), never by a
     #: caller's field update: the audit trail must say what really happened.
@@ -538,6 +544,10 @@ class TaskEntry(Assignable, Temporal, Statusable, Prioritizable, Parentable, Not
             if key not in meta:
                 meta[key] = value
         meta.pop("metadata", None)
+        if self._shadowed_nested:
+            # A key the source spelled twice: its nested value stays nested
+            # beside the promoted top-level one (decision 4: lose nothing).
+            meta["metadata"] = dict(self._shadowed_nested)
         return meta
 
     @classmethod
@@ -547,11 +557,17 @@ class TaskEntry(Assignable, Temporal, Statusable, Prioritizable, Parentable, Not
         parent = meta.get("parent", "") or meta.get("parent_task", "")
         # Collect any top-level frontmatter keys this schema doesn't know
         # about into metadata, so a round-trip load->save doesn't drop them.
-        # Explicit nested `metadata:` block (rare) wins on key collision.
+        # `metadata.k` is a second spelling of field `k` (Andon #994, decision
+        # A), so on a collision the field's own name wins, as it does for a
+        # declared field; the double spelling is reported by `index health`
+        # and `qa validate`, and an update of that field is refused.
         explicit_metadata = meta.get("metadata", {}) or {}
         extra_metadata = {k: v for k, v in meta.items() if k not in _TASK_KNOWN_KEYS}
-        kwargs["metadata"] = {**extra_metadata, **explicit_metadata}
-        return cls(
+        kwargs["metadata"] = {**explicit_metadata, **extra_metadata}
+        # The nested value of a key spelled twice is kept, so a save loses
+        # nothing (#1001, decision 4); `to_frontmatter` writes it back nested.
+        shadowed = {k: v for k, v in explicit_metadata.items() if k in extra_metadata}
+        entry = cls(
             **kwargs,
             status=meta.get("status", "open"),
             status_reason=meta.get("status_reason", "") or "",
@@ -564,3 +580,5 @@ class TaskEntry(Assignable, Temporal, Statusable, Prioritizable, Parentable, Not
             agent_context=meta.get("agent_context", {}) or {},
             status_change_log=meta.get("status_change_log", []) or [],
         )
+        entry._shadowed_nested = shadowed
+        return entry

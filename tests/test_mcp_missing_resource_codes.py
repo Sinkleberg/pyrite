@@ -6,7 +6,7 @@ import json
 import pytest
 
 from pyrite.config import KBConfig, PyriteConfig, Settings
-from pyrite.exceptions import StorageError
+from pyrite.exceptions import StorageBusyError, StorageError
 from pyrite.server.mcp_server import PyriteMCPServer
 
 
@@ -88,14 +88,23 @@ def test_scoped_caller_cannot_distinguish_unreadable_kb_from_absent(mcp_server, 
     assert private["retryable"] is False
 
 
-@pytest.mark.control(
-    reason="unrelated storage failures retain the existing safe UPDATE_FAILED response"
+@pytest.mark.parametrize(
+    ("exc", "retryable"),
+    [(StorageError, False), (StorageBusyError, True)],
+    ids=["storage-error", "storage-busy"],
 )
-def test_unrelated_update_failure_keeps_safe_message_and_retry_semantics(mcp_server, monkeypatch):
+def test_unrelated_update_failure_keeps_safe_message_and_retry_semantics(
+    mcp_server, monkeypatch, exc, retryable
+):
+    """A storage fault on the write is the class's own answer (#971, merged
+    with #981): `STORAGE_ERROR`, `retryable` from the class (a lock held too
+    long is `StorageBusyError`, retryable; a fault is not), the public text
+    naming no path. Before #971 both were `UPDATE_FAILED`, `retryable: true`,
+    which is still `kb_update`'s answer for any other `PyriteError`."""
     mcp_server.svc.create_entry("notes", "present", "Present", "note", "body")
 
     def fail(*_args, **_kwargs):
-        raise StorageError("sensitive/path/index.db is locked")
+        raise exc("sensitive/path/index.db is locked")
 
     # The file write's OS edge, so the real update path runs up to it (the
     # rule in test_tests_drive_the_surface_not_the_mock.py).
@@ -105,8 +114,8 @@ def test_unrelated_update_failure_keeps_safe_message_and_retry_semantics(mcp_ser
         "kb_update",
         {"kb_name": "notes", "entry_id": "present", "title": "New title"},
     )
-    assert result["error_code"] == "UPDATE_FAILED"
-    assert result["retryable"] is True
+    assert result["error_code"] == "STORAGE_ERROR", result
+    assert result["retryable"] is retryable
     assert "sensitive/path" not in result["error"]
 
 

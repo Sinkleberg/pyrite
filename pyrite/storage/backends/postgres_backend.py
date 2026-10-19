@@ -162,6 +162,9 @@ def ensure_schema(engine) -> None:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         conn.execute(text("ALTER TABLE entry ADD COLUMN IF NOT EXISTS fts_vector tsvector"))
         conn.execute(text("ALTER TABLE entry ADD COLUMN IF NOT EXISTS embedding vector(384)"))
+        # The link's `kb:` prefix as written (#980): create_all never alters an
+        # existing table, so a database from before it gets the column here.
+        conn.execute(text("ALTER TABLE link ADD COLUMN IF NOT EXISTS target_prefix TEXT"))
         # GIN index for FTS
         conn.execute(
             text("CREATE INDEX IF NOT EXISTS idx_entry_fts ON entry USING gin(fts_vector)")
@@ -326,6 +329,7 @@ class PostgresBackend(BaseBackend):
                     relation=relation,
                     inverse_relation=inverse,
                     note=link.get("note", ""),
+                    target_prefix=link.get("prefix"),
                 )
             )
 
