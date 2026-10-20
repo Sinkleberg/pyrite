@@ -446,7 +446,7 @@ def _vocabulary_matches(code: str) -> list[tuple[int, str]]:
 
 
 def touches_security(source: str) -> bool:
-    return SECURITY_VOCABULARY.search(_NOT_VOCABULARY.sub("", source)) is not None
+    return bool(_vocabulary_matches(code_only(source)))
 
 
 def format_hit(nodeid: str, line: int, word: str) -> str:

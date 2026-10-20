@@ -223,30 +223,17 @@ class TestMatching:
 # -- Property 2: decided by what a test checks, not by its name -------------
 
 
-def _experimental_test_bodies():
-    """(node id without parameters, source) of every test function the
-    mapping marks experimental, read with ``ast`` from the files."""
-    import ast
-
+def _experimental_security_hits():
+    """nodeid -> [(line, word)] for every test function the mapping marks experimental
+    that touches the security vocabulary in code (see ``surface.security_hits``)."""
+    found = {}
     for path in sorted(
         [*REPO.glob("tests/**/test_*.py"), *REPO.glob("extensions/*/tests/**/test_*.py")]
     ):
         rel = path.relative_to(REPO).as_posix()
-        src = path.read_text()
-        tree = ast.parse(src)
-
-        def walk(node, prefix, rel=rel, src=src):
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, ast.ClassDef):
-                    yield from walk(child, [*prefix, child.name])
-                elif isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) and (
-                    child.name.startswith("test")
-                ):
-                    nodeid = "::".join([rel, *prefix, child.name])
-                    if surface.is_experimental(nodeid):
-                        yield nodeid, ast.get_source_segment(src, child) or ""
-
-        yield from walk(tree, [])
+        hits = surface.security_hits(path.read_text(), rel)
+        found.update({n: h for n, h in hits.items() if surface.is_experimental(n)})
+    return found
 
 
 class TestSecurityVocabularyNeedsAReason:
@@ -260,9 +247,10 @@ class TestSecurityVocabularyNeedsAReason:
 
     def test_every_experimental_test_touching_security_is_reviewed(self):
         unreviewed = [
-            nodeid
-            for nodeid, body in _experimental_test_bodies()
-            if surface.touches_security(body) and not surface.reviewed_reason(nodeid)
+            surface.format_hit(nodeid, line, word)
+            for nodeid, hits in _experimental_security_hits().items()
+            if not surface.reviewed_reason(nodeid)
+            for line, word in hits
         ]
         assert not unreviewed, (
             "experimental tests that touch a security property: list each in "
@@ -271,9 +259,7 @@ class TestSecurityVocabularyNeedsAReason:
         )
 
     def test_no_reviewed_entry_is_stale(self):
-        hits = {
-            nodeid for nodeid, body in _experimental_test_bodies() if surface.touches_security(body)
-        }
+        hits = set(_experimental_security_hits())
         stale = [
             p for p in surface.REVIEWED_EXPERIMENTAL if not any(surface.matches(n, p) for n in hits)
         ]
