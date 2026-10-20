@@ -304,6 +304,124 @@ class TestSecurityVocabularyNeedsAReason:
         assert surface.touches_security("assert not path.is_relative_to(root)")
 
 
+class TestTheVocabularyReadsCodeAndFollowsHelpers:
+    """#1075. The vocabulary guard is a security gate (it keeps a security test out of the
+    experimental lane), so what it reads is pinned on planted sources. Prose is not code: a
+    docstring or a comment that says 'readable' is no property under test. A string literal is
+    code: "../" and "<script" are the inputs of a security test. Helpers are followed when a
+    test calls a module-level function of its own file, to a fixed point; a helper in another
+    file (conftest.py, tests/*.py) is not read, so a test whose only security word lives there
+    is not seen."""
+
+    def hits(self, source):
+        return surface.security_hits(textwrap.dedent(source), "tests/test_x.py")
+
+    def test_a_docstring_alone_is_not_flagged(self):
+        assert (
+            self.hits(
+                """
+            def test_a():
+                '''the readable version'''
+                assert 1
+            """
+            )
+            == {}
+        )
+
+    def test_a_comment_alone_is_not_flagged(self):
+        assert (
+            self.hits(
+                """
+            def test_a():
+                assert 1  # a password is never involved
+            """
+            )
+            == {}
+        )
+
+    def test_a_string_literal_is_flagged_with_its_line(self):
+        assert self.hits(
+            """
+            def test_a():
+                x = 1
+                get("../etc/passwd")
+            """
+        ) == {"tests/test_x.py::test_a": [(4, "../")]}
+
+    @pytest.mark.parametrize("word", ["<script", "password", "javascript:"])
+    def test_security_inputs_in_strings_stay_flagged(self, word):
+        found = self.hits(f"def test_a():\n    send({word!r})\n")
+        assert [w.lower() for _, w in found["tests/test_x.py::test_a"]] == [word]
+
+    def test_a_match_in_a_same_file_helper_the_test_calls_is_flagged(self):
+        found = self.hits(
+            """
+            def _login():
+                return post({"password": "x"})
+
+            def test_a():
+                _login()
+
+            def test_b():
+                pass
+            """
+        )
+        assert found == {"tests/test_x.py::test_a": [(3, "password")]}
+
+    def test_helpers_are_followed_through_other_helpers_and_recursion(self):
+        found = self.hits(
+            """
+            def _a():
+                _b()
+
+            def _b():
+                _a()
+                return "Bearer abc"
+
+            def test_a():
+                _a()
+            """
+        )
+        assert found == {"tests/test_x.py::test_a": [(7, "Bearer")]}
+
+    def test_a_helper_the_test_does_not_call_is_not_attributed(self):
+        assert (
+            self.hits(
+                """
+            def _unused():
+                return "password"
+
+            def test_a():
+                pass
+            """
+            )
+            == {}
+        )
+
+    def test_a_docstring_in_a_followed_helper_is_not_flagged(self):
+        assert (
+            self.hits(
+                """
+            def _h():
+                '''redact nothing'''
+
+            def test_a():
+                _h()
+            """
+            )
+            == {}
+        )
+
+    def test_the_failure_line_names_the_test_the_line_and_the_word(self):
+        assert (
+            surface.format_hit("tests/test_x.py::test_a", 4, "../")
+            == "tests/test_x.py::test_a:4 matched '../'"
+        )
+
+    def test_unscoped_plumbing_is_still_ignored(self):
+        assert self.hits("def test_a():\n    db.get(readable_kbs=UNSCOPED)\n") == {}
+
+
 # -- A broken experimental-only file does not stop the core --------------------
 
 _BROKEN = "import module_that_does_not_exist\n\ndef test_x():\n    pass\n"

@@ -37,7 +37,10 @@ checks every pattern still matches a collected test.
 
 from __future__ import annotations
 
+import ast
+import io
 import re
+import tokenize
 from dataclasses import dataclass
 from functools import lru_cache, cache
 
@@ -392,8 +395,119 @@ SECURITY_VOCABULARY = re.compile(
 _NOT_VOCABULARY = re.compile(r"readable_kbs=UNSCOPED|_inject_llm")
 
 
+def _blank(text: str, start: int, end: int) -> str:
+    """``text`` with [start, end) replaced by spaces, keeping line breaks and offsets."""
+    return text[:start] + re.sub(r"[^\n]", " ", text[start:end]) + text[end:]
+
+
+def code_only(source: str) -> str:
+    """``source`` with comments and docstrings blanked out, same length and same
+    lines, so a match keeps its line number. Every other string literal stays:
+    a security test's inputs ("../", "<script", "password") are strings."""
+    starts = [0]
+    for line in source.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    lines = source.splitlines()
+
+    def offset(row: int, col: int, byte_col: bool = False) -> int:
+        if byte_col:  # ast counts UTF-8 bytes, tokenize counts characters
+            col = len(lines[row - 1].encode()[:col].decode(errors="ignore"))
+        return starts[row - 1] + col
+
+    spans: list[tuple[int, int]] = []
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            first = node.body[0] if node.body else None
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                spans.append(
+                    (
+                        offset(first.lineno, first.col_offset, True),
+                        offset(first.end_lineno, first.end_col_offset, True),
+                    )
+                )
+    for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+        if tok.type == tokenize.COMMENT:
+            spans.append((offset(*tok.start), offset(*tok.end)))
+    for start, end in spans:
+        source = _blank(source, start, end)
+    return source
+
+
+def _vocabulary_matches(code: str) -> list[tuple[int, str]]:
+    """(offset, word) of each vocabulary hit in already-clean code, ignoring plumbing."""
+    for m in _NOT_VOCABULARY.finditer(code):
+        code = _blank(code, m.start(), m.end())
+    return [(m.start(), m.group(0)) for m in SECURITY_VOCABULARY.finditer(code)]
+
+
 def touches_security(source: str) -> bool:
     return SECURITY_VOCABULARY.search(_NOT_VOCABULARY.sub("", source)) is not None
+
+
+def format_hit(nodeid: str, line: int, word: str) -> str:
+    return f"{nodeid}:{line} matched {word!r}"
+
+
+def security_hits(source: str, rel: str) -> dict[str, list[tuple[int, str]]]:
+    """nodeid -> [(line, word)] for each test function of one file that touches the
+    vocabulary, in code only (no comments, no docstrings).
+
+    A test is also charged with the code of every module-level function of the same
+    file that it calls, directly or through other helpers (to a fixed point; recursion
+    ends). Not followed: a helper in another file (conftest.py, a tests/ module), a
+    method called through ``self``, a constant read by name.
+    """
+    tree = ast.parse(source)
+    code = code_only(source)
+    starts = [0]
+    for line in code.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    helpers = {
+        n.name: n for n in tree.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+
+    def line_of(offset: int) -> int:
+        return sum(1 for s in starts[1:] if s <= offset) + 1
+
+    def hits_in(fn: ast.AST) -> list[tuple[int, str]]:
+        lo = starts[fn.lineno - 1]
+        end_row = fn.end_lineno
+        hi = starts[end_row] if end_row < len(starts) else len(code)
+        body = code[lo:hi]
+        return [(line_of(lo + off), word) for off, word in _vocabulary_matches(body)]
+
+    def reached(test: ast.AST) -> list[ast.AST]:
+        seen, queue = {id(test)}, [test]
+        order = [test]
+        while queue:
+            for call in (c for c in ast.walk(queue.pop()) if isinstance(c, ast.Call)):
+                helper = helpers.get(call.func.id) if isinstance(call.func, ast.Name) else None
+                if helper is not None and id(helper) not in seen:
+                    seen.add(id(helper))
+                    queue.append(helper)
+                    order.append(helper)
+        return order
+
+    found: dict[str, list[tuple[int, str]]] = {}
+
+    def walk(node: ast.AST, prefix: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                walk(child, [*prefix, child.name])
+            elif isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) and (
+                child.name.startswith("test")
+            ):
+                hits = sorted({h for fn in reached(child) for h in hits_in(fn)})
+                if hits:
+                    found["::".join([rel, *prefix, child.name])] = hits
+
+    walk(tree, [])
+    return found
 
 
 # Experimental tests that touch the vocabulary and are not security tests,
