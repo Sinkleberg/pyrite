@@ -470,6 +470,7 @@ def _two_files(cli_world, tmp_path):
     return world, root
 
 
+@pytest.mark.control(reason="dev linked to this target (as an event); red only against round 0")
 def test_a_link_to_a_file_that_does_not_load_is_not_a_link_to_nothing(cli_world, tmp_path):
     world, root = _two_files(cli_world, tmp_path)
 

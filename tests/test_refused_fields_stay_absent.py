@@ -149,6 +149,7 @@ def test_a_full_echo_of_a_read_leaves_the_files_bytes_alone(world, shape):
     assert "load_problems" in res.get("ignored", [])
 
 
+@pytest.mark.control(reason="dev never moved this file; red only against the round-1 head")
 def test_a_templated_move_never_runs_on_the_partial_model(make_world):
     world = make_world(
         {
