@@ -296,6 +296,25 @@ class FrontmatterError(ValidationError):
     error_code = "INVALID_FRONTMATTER"
 
 
+class EntryLoadError(FrontmatterError):
+    """A file whose frontmatter parses but cannot be loaded as the type it
+    declares: its type's loader raised (a value that will not convert, a
+    missing field, a plugin validator). The message is the loader's own;
+    ``path`` and ``entry_type`` say which file and which type, and the
+    loader's exception is the ``__cause__``.
+
+    The file is unreadable, never another type (#1261): the reconcile lists
+    it under ``malformed`` and indexes no row for it, as for any other
+    ``FrontmatterError``. #777 maps the read side of unreadable files to
+    ``ENTRY_UNREADABLE``; until then this keeps ``INVALID_FRONTMATTER``.
+    """
+
+    def __init__(self, message: str, *, path=None, entry_type: str | None = None):
+        super().__init__(message)
+        self.path = path
+        self.entry_type = entry_type
+
+
 class PluginError(PyriteError):
     """Raised when a plugin operation fails.
 

@@ -18,6 +18,7 @@ from ..config import KBConfig
 from ..exceptions import (
     ConflictError,
     EntryExistsError,
+    EntryLoadError,
     EntryNotFoundError,
     FrontmatterError,
     KBReadOnlyError,
@@ -33,7 +34,7 @@ from ..models.core_types import (
     read_entry_id,
 )
 from ..schema import CORE_TYPES
-from ..utils.frontmatter import Frontmatter, split_frontmatter
+from ..utils.frontmatter import Frontmatter, describe, split_frontmatter
 from ..utils.kb_files import KBFiles
 from ..utils.yaml import load_yaml, load_yaml_file
 from .entry_writer import (
@@ -332,15 +333,6 @@ def _plain_for_file(value: object) -> object:
     return value
 
 
-def _event_fallback(file_path: Path, text: str | None) -> Entry:
-    """``EventEntry.load``, from ``text`` when the caller already read it."""
-    if text is None:
-        return EventEntry.load(file_path)
-    entry = EventEntry.from_markdown(text)
-    entry.file_path = file_path
-    return entry
-
-
 class KBRepository:
     """
     File-based repository for a single knowledge base.
@@ -365,60 +357,67 @@ class KBRepository:
         return Entry
 
     def _load_entry(self, file_path: Path, text: str | None = None) -> Entry:
-        """Load an entry from a file, dispatching to the correct type.
+        """Load an entry from a file as the type its frontmatter declares.
 
         ``text``: the file's text, already read (``load_entry_from_bytes``);
         read here when None.
-        """
-        # Try to load with type-aware parsing
-        try:
-            # Read frontmatter to determine type
-            if text is None:
-                text = file_path.read_text(encoding="utf-8")
-            split = split_frontmatter(text)
-            if isinstance(split, Frontmatter):
-                fm = load_yaml(split.text)
-                if fm and isinstance(fm, dict):
-                    body = split.body
-                    fm = self._maybe_migrate(fm)
-                    # `fm` is the entry's frontmatter and nothing else. It
-                    # used to get `body` and `file_path` injected here, but
-                    # no from_frontmatter reads either (body arrives as the
-                    # positional argument, file_path is set by the caller),
-                    # while capture_extra_frontmatter reads this same dict to
-                    # decide which keys the class did not declare -- so the
-                    # two internals were recorded as "unknown frontmatter"
-                    # and written back into the file on the next save (#46).
-                    entry = entry_from_frontmatter(fm, body)
-                    # Preserve references in metadata if present in frontmatter
-                    # (typed entries drop unknown fields during from_frontmatter)
-                    if "references" in fm and fm["references"]:
-                        if not hasattr(entry, "metadata") or not entry.metadata:
-                            entry.metadata = {}
-                        if "references" not in entry.metadata:
-                            entry.metadata["references"] = fm["references"]
-                    return entry
 
-            # Fallback: try EventEntry.load for backward compat
-            return _event_fallback(file_path, text)
-        except FrontmatterError:
-            # Malformed YAML: the EventEntry fallback re-parses the same bytes
-            # and would fail identically, so re-raise rather than retry.
-            logger.warning("Entry load failed for %s: malformed frontmatter", file_path)
+        Returns an entry of the declared type, or raises. A read error
+        (``OSError``, ``UnicodeError``) propagates as itself, so the reconcile
+        can tell an unreadable file from one with bad content. Frontmatter
+        that is missing, does not parse, is not a mapping or is empty raises
+        ``FrontmatterError``; a type loader that raises is ``EntryLoadError``
+        naming the file and the declared type. No path substitutes another
+        type: this used to fall back to ``EventEntry`` of the same file, which
+        indexed a ``backlog_item`` with a bad ``rank`` as an ``event`` and
+        dropped it from its typed views with nothing reported (#1261).
+        """
+        if text is None:
+            text = file_path.read_text(encoding="utf-8")
+        try:
+            split = split_frontmatter(text)
+            if not isinstance(split, Frontmatter):
+                raise FrontmatterError(f"Invalid entry format: {describe(split)}")
+            fm = load_yaml(split.text)
+            if not fm or not isinstance(fm, dict):
+                # No type, no id, no title (`---\n---`): the event fallback
+                # gave every such file the same id, `entry-da39a3ee` (#639).
+                raise FrontmatterError("Invalid entry format: the frontmatter is empty")
+            body = split.body
+            try:
+                fm = self._maybe_migrate(fm)
+                # `fm` is the entry's frontmatter and nothing else. It used
+                # to get `body` and `file_path` injected here, but no
+                # from_frontmatter reads either (body arrives as the
+                # positional argument, file_path is set by the caller), while
+                # capture_extra_frontmatter reads this same dict to decide
+                # which keys the class did not declare -- so the two
+                # internals were recorded as "unknown frontmatter" and
+                # written back into the file on the next save (#46).
+                entry = entry_from_frontmatter(fm, body)
+            except FrontmatterError:
+                raise
+            except Exception as e:
+                declared = fm.get("type")
+                raise EntryLoadError(
+                    str(e) or type(e).__name__,
+                    path=file_path,
+                    entry_type=str(declared) if declared else None,
+                ) from e
+        except FrontmatterError as e:
+            # One line, never a traceback: per-file tracebacks drowned bulk
+            # sync output (Tier A 1080); the reconcile reports the file under
+            # `malformed` with this message.
+            logger.warning("Entry load failed for %s: %s", file_path, e)
             raise
-        except Exception as e:
-            # Log a one-line warning instead of a full traceback. Per-file
-            # tracebacks spam the operator during bulk sync (a research KB's
-            # drafts hit ~13 of these every operation). The underlying parse
-            # error is wrapped into FrontmatterError on re-raise from
-            # EventEntry.load if the cause is YAML; sync_incremental's
-            # malformed-summary captures it. Tier A 1080.
-            logger.warning(
-                "Entry load failed for %s, trying EventEntry fallback: %s",
-                file_path,
-                e,
-            )
-            return _event_fallback(file_path, text)
+        # Preserve references in metadata if present in frontmatter
+        # (typed entries drop unknown fields during from_frontmatter)
+        if "references" in fm and fm["references"]:
+            if not hasattr(entry, "metadata") or not entry.metadata:
+                entry.metadata = {}
+            if "references" not in entry.metadata:
+                entry.metadata["references"] = fm["references"]
+        return entry
 
     def _maybe_migrate(self, fm: dict) -> dict:
         """Apply pending schema migrations to frontmatter if needed."""
