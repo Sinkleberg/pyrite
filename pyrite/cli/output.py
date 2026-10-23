@@ -1,6 +1,38 @@
 """CLI output formatting utilities."""
 
 import typer
+from rich.console import Console
+from rich.text import Text
+
+
+def cli_console(*, stderr: bool = False, highlight: bool = True) -> Console:
+    """Keep CLI text, including paths, whole when output is captured or copied.
+
+    Rich renderables (tables, panels, etc.) still use the terminal width.
+    Strings retain their literal line breaks instead of being folded or cropped.
+    """
+    return Console(soft_wrap=True, stderr=stderr, highlight=highlight)
+
+
+def path_line(
+    prefix: str,
+    path: object,
+    suffix: str = "",
+    *,
+    style: str = "",
+    path_style: str = "",
+) -> Text:
+    """Style the labels while keeping every path character literal.
+
+    A Text value also preserves trailing backslashes, which markup escaping
+    can duplicate or consume when combined with surrounding style tags.
+    """
+    return Text.assemble(
+        Text.from_markup(prefix),
+        Text(str(path), style=path_style),
+        Text.from_markup(suffix),
+        style=style,
+    )
 
 
 def validate_output_format(value: str) -> str:

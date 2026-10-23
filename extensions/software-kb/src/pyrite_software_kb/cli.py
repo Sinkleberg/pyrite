@@ -5,11 +5,10 @@ import logging
 from typing import Any
 
 import typer
-from rich.console import Console
 from rich.table import Table
 
 from pyrite.cli.context import require_entry_kb, require_kb
-from pyrite.cli.output import output_format_choice
+from pyrite.cli.output import cli_console, output_format_choice, path_line
 from pyrite.config import load_config
 from pyrite.services.access_policy import UNSCOPED
 from pyrite.storage.database import PyriteDB
@@ -23,7 +22,7 @@ from .adr_listing import (
 )
 
 sw_app = typer.Typer(help="Software KB commands (ADRs, backlog, standards, components)")
-console = Console()
+console = cli_console()
 logger = logging.getLogger(__name__)
 
 
@@ -262,7 +261,7 @@ def sw_new_adr(
         file_path = repo._resolve_file_path(entry, repo._infer_subdir(entry))
 
         console.print(f"[green]Created ADR-{next_num:04d}:[/green] {title}")
-        console.print(f"  File: [cyan]{file_path}[/cyan]")
+        console.print(path_line("  File: ", file_path, path_style="cyan"))
         console.print(f"  Status: [yellow]{status}[/yellow]")
     finally:
         db.close()
@@ -780,7 +779,9 @@ def sw_migrate_standards(
                 continue
             root = row_kb.path
             if not path.exists():
-                console.print(f"  [red]Skip[/red] {row['title']}: file not found at {path}")
+                console.print(
+                    path_line(f"  [red]Skip[/red] {row['title']}: file not found at ", path)
+                )
                 skipped += 1
                 continue
 
@@ -828,14 +829,22 @@ def sw_migrate_standards(
                     skipped += 1
                     continue
                 except FileExistsError:
-                    console.print(f"  [red]Skip[/red] {row['title']}: {new_path} already exists")
+                    console.print(
+                        path_line(
+                            f"  [red]Skip[/red] {row['title']}: ", new_path, " already exists"
+                        )
+                    )
                     skipped += 1
                     continue
                 except FileChanged:
-                    console.print(f"  [red]Skip[/red] {row['title']}: {path} changed; run again")
+                    console.print(
+                        path_line(
+                            f"  [red]Skip[/red] {row['title']}: ", path, " changed; run again"
+                        )
+                    )
                     skipped += 1
                     continue
-                console.print(f"  [green]Migrated[/green] {row['title']} -> {new_path}")
+                console.print(path_line(f"  [green]Migrated[/green] {row['title']} -> ", new_path))
             else:
                 try:
                     publish_entry_text(path, new_text, expect=raw, root=root)
@@ -844,7 +853,11 @@ def sw_migrate_standards(
                     skipped += 1
                     continue
                 except FileChanged:
-                    console.print(f"  [red]Skip[/red] {row['title']}: {path} changed; run again")
+                    console.print(
+                        path_line(
+                            f"  [red]Skip[/red] {row['title']}: ", path, " changed; run again"
+                        )
+                    )
                     skipped += 1
                     continue
                 console.print(f"  [green]Migrated[/green] {row['title']} (type updated in place)")
@@ -1392,7 +1405,7 @@ def sw_log_cmd(
         console.print(f"[green]Logged:[/green] {result['id']}")
         console.print(f"  Item: {item_id}")
         console.print(f"  Date: {result.get('date', '')}")
-        console.print(f"  File: [cyan]{result.get('filename', '')}[/cyan]")
+        console.print(path_line("  File: ", result.get("filename", ""), path_style="cyan"))
     else:
         console.print(f"[red]Error:[/red] {result.get('error', 'Unknown error')}")
         raise typer.Exit(1)

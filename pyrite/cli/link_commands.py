@@ -18,6 +18,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from pyrite.cli.output import cli_console
+
 from ..exceptions import EntryNotFoundError, KBNotFoundError, ValidationError
 from ..services.access_policy import UNSCOPED
 from .context import cli_context, get_config_and_db, read_input_file, require_kb
@@ -25,7 +27,7 @@ from .outcome import Outcome
 from .output import OUTPUT_FORMAT
 
 links_app = typer.Typer(help="Link validation and inspection")
-console = Console()
+console = cli_console()
 
 
 @links_app.command("check")

@@ -9,14 +9,15 @@ import logging
 from pathlib import Path
 
 import typer
-from rich.console import Console
+
+from pyrite.cli.output import cli_console, path_line
 
 from ..models.task import TASK_KB_PRESET
 from .output import validate_output_format
 
 logger = logging.getLogger(__name__)
 
-console = Console()
+console = cli_console()
 
 
 def _format_output(data: dict, fmt: str) -> str | None:
@@ -485,7 +486,9 @@ def init_kb(
         if formatted is not None:
             typer.echo(formatted)
         else:
-            console.print(f"[yellow]Warning:[/yellow] {path}/kb.yaml already exists. Skipping.")
+            console.print(
+                path_line("[yellow]Warning:[/yellow] ", path, "/kb.yaml already exists. Skipping.")
+            )
         return
 
     # Resolve preset: try plugin presets first, fall back to built-in
@@ -572,7 +575,7 @@ def init_kb(
         typer.echo(formatted)
     else:
         console.print(f"[green]Created KB:[/green] {kb_name}")
-        console.print(f"  Path: {path}")
+        console.print(path_line("  Path: ", path))
         console.print(f"  Template: {template}")
         if type_names:
             console.print(f"  Types: {', '.join(type_names)}")

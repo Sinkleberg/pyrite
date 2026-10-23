@@ -102,10 +102,11 @@ def cli_error(
 
 def _print_error_line(payload: dict[str, Any]) -> None:
     """The rich form of the error shape, on stdout."""
-    from rich.console import Console
     from rich.text import Text
 
-    console = Console()
+    from pyrite.cli.output import cli_console
+
+    console = cli_console()
     # The styled labels are ours and stay markup; the message and the
     # suggestion are data -- an extra like `pyrite[semantic]`, a JSON
     # example, an entry id -- and Rich would parse their brackets as style
@@ -563,9 +564,9 @@ def _outcome_answer(outcome: Any, fmt: str) -> _Answer:
         return _Answer(code, text=document(outcome, fmt))
 
     def show() -> None:
-        from rich.console import Console
+        from pyrite.cli.output import cli_console
 
-        (outcome.rich or print_fields)(Console(), outcome.data)
+        (outcome.rich or print_fields)(cli_console(), outcome.data)
 
     return _Answer(code, show=show)
 

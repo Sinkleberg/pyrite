@@ -4,7 +4,8 @@ import logging
 from pathlib import Path
 
 import typer
-from rich.console import Console
+
+from pyrite.cli.output import cli_console, path_line
 
 from ..cli.context import cli_context
 from ..services.access_policy import UNSCOPED
@@ -12,7 +13,7 @@ from ..utils.errors import exit_unless_whole
 from ..utils.frontmatter import Frontmatter, split_frontmatter
 
 logger = logging.getLogger(__name__)
-console = Console()
+console = cli_console()
 
 export_app = typer.Typer(help="Export KB entries to external formats")
 
@@ -204,8 +205,8 @@ def export_collection(
 
         console.print(f"[green]Exported {result['entries_exported']} entries[/green]")
         console.print(f"  Files created: {result['files_created']}")
-        console.print(f"  Manifest: {output / '_manifest.md'}")
-        console.print(f"  Output: {output}")
+        console.print(path_line("  Manifest: ", output / "_manifest.md"))
+        console.print(path_line("  Output: ", output))
         if unreadable:
             console.print(
                 f"[yellow]{len(unreadable)} matched entr(ies) could not be loaded "
@@ -265,7 +266,7 @@ def export_site(
         if init:
             scaffolded = scaffold_quartz_project(output, kb_name=kb_config.name)
             for f in scaffolded:
-                console.print(f"  [dim]Created {f}[/dim]")
+                console.print(path_line("  Created ", f, style="dim"))
 
         # Load all entries from DB
         raw_entries = svc.list_entries(kb_name=kb, limit=100000)
@@ -301,12 +302,12 @@ def export_site(
         if result["skipped"]:
             console.print(f"  Skipped: {result['skipped']} (filtered)")
         console.print(f"  Files created: {result['files_created']}")
-        console.print(f"  Output: {content_dir}")
+        console.print(path_line("  Output: ", content_dir))
 
         if init:
             console.print("")
             console.print("[bold]Next steps:[/bold]")
-            console.print(f"  cd {output}")
+            console.print(path_line("  cd ", output))
             console.print("  npm install")
             console.print("  npx quartz build --serve")
 

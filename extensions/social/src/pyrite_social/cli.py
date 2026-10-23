@@ -3,15 +3,15 @@
 from datetime import UTC, datetime
 
 import typer
-from rich.console import Console
 from rich.table import Table
 
 from pyrite.cli.context import require_entry_kb, require_kb
+from pyrite.cli.output import cli_console
 from pyrite.config import load_config
 from pyrite.storage.database import PyriteDB
 
 social_app = typer.Typer(help="Social knowledge base commands")
-console = Console()
+console = cli_console()
 
 
 @social_app.command("vote")

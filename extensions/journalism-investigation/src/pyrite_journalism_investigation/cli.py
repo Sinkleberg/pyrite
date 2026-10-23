@@ -3,10 +3,10 @@
 import json as json_mod
 
 import typer
-from rich.console import Console
 from rich.table import Table
 
 from pyrite.cli.context import require_kb
+from pyrite.cli.output import cli_console, path_line
 from pyrite.config import load_config
 from pyrite.exceptions import QueryTooLongError
 from pyrite.storage.database import PyriteDB
@@ -14,7 +14,7 @@ from pyrite.storage.database import PyriteDB
 from .plugin import _EXPERIMENTAL_NOTICE, JournalismInvestigationPlugin
 
 investigation_app = typer.Typer(help=f"{_EXPERIMENTAL_NOTICE}\n\nJournalism investigation commands")
-console = Console()
+console = cli_console()
 
 
 def _emit_json_result(result: dict) -> None:
@@ -645,7 +645,7 @@ def ownership_chain(
             path_str = " -> ".join(
                 f"{n['title']} ({n['percentage']}%)" for n in reversed(chain["path"])
             )
-            console.print(f"  {i}. {path_str} -> {entity['title']}")
+            console.print(path_line(f"  {i}. ", path_str, f" -> {entity['title']}"))
             console.print(f"     Effective ownership: {chain['effective_percentage']:.1f}%")
         console.print()
 
@@ -789,7 +789,7 @@ def export_pack(
         if output:
             with open(output, "w") as f:
                 f.write(content)
-            console.print(f"[green]Exported to {output}[/green]")
+            console.print(path_line("Exported to ", output, style="green"))
         else:
             console.print(content)
     finally:
@@ -1009,7 +1009,7 @@ def ftm_export(
             with open(output, "w") as f:
                 f.write(json_output)
                 f.write("\n")
-            console.print(f"[green]Exported {len(result)} entities to {output}[/green]")
+            console.print(path_line(f"Exported {len(result)} entities to ", output, style="green"))
         else:
             sys.stdout.write(json_output)
             sys.stdout.write("\n")

@@ -1,15 +1,16 @@
 """CLI commands for collections — list and query."""
 
 import typer
-from rich.console import Console
 from rich.table import Table
+
+from pyrite.cli.output import cli_console
 
 from ..services.access_policy import UNSCOPED
 from .context import cli_context
 from .output import validate_output_format
 
 collections_app = typer.Typer(help="Collection management")
-console = Console()
+console = cli_console()
 
 
 @collections_app.command("list")

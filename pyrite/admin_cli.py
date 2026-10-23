@@ -11,7 +11,8 @@ For read-only operations: pyrite-read
 from pathlib import Path
 
 import typer
-from rich.console import Console
+
+from pyrite.cli.output import cli_console, path_line
 
 from .cli.context import require_kb
 from .config import (
@@ -32,7 +33,7 @@ app = typer.Typer(
     no_args_is_help=True,
     epilog=logging_epilog("pyrite-admin"),
 )
-console = Console()
+console = cli_console()
 
 # =============================================================================
 # Sub-apps
@@ -76,7 +77,7 @@ def kb_list(
 
     for kb in kbs:
         console.print(f"  [bold cyan]{kb.name}[/bold cyan] ({kb.kb_type})")
-        console.print(f"    Path: {kb.path}")
+        console.print(path_line("    Path: ", kb.path))
         if kb.description:
             console.print(f"    {kb.description}")
 
@@ -442,7 +443,7 @@ def repo_status():
 
     for repo in config.repositories:
         console.print(f"  [bold cyan]{repo.name}[/bold cyan]")
-        console.print(f"    Path: {repo.path}")
+        console.print(path_line("    Path: ", repo.path))
         if repo.remote:
             console.print(f"    Remote: {repo.remote}")
         console.print(f"    Branch: {repo.branch}")
@@ -592,7 +593,7 @@ def auth_logout():
 def config_show():
     """Show current configuration."""
     config_file = current_config_file()
-    console.print(f"[bold]Config file:[/bold] {config_file}")
+    console.print(path_line("[bold]Config file:[/bold] ", config_file))
     console.print(f"[bold]Exists:[/bold] {config_file.exists()}")
 
     if config_file.exists():
@@ -601,7 +602,7 @@ def config_show():
         console.print(f"[bold]Repositories:[/bold] {len(config.repositories)}")
         console.print(f"[bold]Subscriptions:[/bold] {len(config.subscriptions)}")
         console.print(f"[bold]AI Provider:[/bold] {config.settings.ai_provider}")
-        console.print(f"[bold]Index Path:[/bold] {config.settings.index_path}")
+        console.print(path_line("[bold]Index Path:[/bold] ", config.settings.index_path))
 
 
 @config_app.command("set")

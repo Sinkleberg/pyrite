@@ -5,15 +5,16 @@ Commands: validate, status, assess
 """
 
 import typer
-from rich.console import Console
 from rich.table import Table
+
+from pyrite.cli.output import cli_console
 
 from ..services.access_policy import UNSCOPED
 from .context import cli_context
 from .output import output_format_choice, validate_output_format
 
 qa_app = typer.Typer(help="Quality assurance validation and assessment")
-console = Console()
+console = cli_console()
 
 
 def _format_output(data: dict, fmt: str) -> str | None:

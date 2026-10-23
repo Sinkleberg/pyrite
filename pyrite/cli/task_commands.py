@@ -14,8 +14,9 @@ import json
 from typing import Any
 
 import typer
-from rich.console import Console
 from rich.table import Table
+
+from pyrite.cli.output import cli_console
 
 from ..exceptions import EntryNotFoundError, ValidationError
 from ..services.access_policy import UNSCOPED
@@ -307,7 +308,7 @@ def task_status(
 ) -> Outcome:
     """[Deprecated] Alias for `task get`. Use `task get` instead."""
     # Deprecation notice goes to stderr so it never corrupts JSON on stdout.
-    Console(stderr=True).print(
+    cli_console(stderr=True).print(
         "[yellow]Warning:[/yellow] `task status` is deprecated and will be "
         "removed in 0.27; use `task get` instead.",
         style="dim",

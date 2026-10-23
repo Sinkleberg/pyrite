@@ -5,16 +5,16 @@ from collections.abc import Iterator
 from typing import Any
 
 import typer
-from rich.console import Console
 from rich.table import Table
 
 from pyrite.cli.context import require_kb
+from pyrite.cli.output import cli_console, path_line
 from pyrite.config import load_config
 from pyrite.services.access_policy import UNSCOPED
 from pyrite.storage.database import PyriteDB
 
 zettel_app = typer.Typer(help="Zettelkasten knowledge management")
-console = Console()
+console = cli_console()
 logger = logging.getLogger(__name__)
 
 
@@ -109,7 +109,7 @@ def zettel_new(
     finally:
         db.close()
 
-    console.print(f"[green]Created {zettel_type} note:[/green] {file_path}")
+    console.print(path_line(f"[green]Created {zettel_type} note:[/green] ", file_path))
 
 
 @zettel_app.command("inbox")

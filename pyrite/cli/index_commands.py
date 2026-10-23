@@ -7,8 +7,9 @@ Commands: build, sync, stats, embed, health
 import logging
 
 import typer
-from rich.console import Console
 from rich.table import Table
+
+from pyrite.cli.output import cli_console, path_line
 
 from ..utils.errors import PARTIAL_EXIT, cli_error, exit_unless_whole
 from .context import cli_db_context, get_config_and_db, require_kb
@@ -17,7 +18,7 @@ from .output import validate_output_format
 logger = logging.getLogger(__name__)
 
 index_app = typer.Typer(help="Search index management")
-console = Console()
+console = cli_console()
 
 
 def _format_output(data: dict, fmt: str) -> str | None:
@@ -247,7 +248,7 @@ def index_sync(
     if malformed:
         console.print(f"  [yellow]Malformed: {len(malformed)} file(s) skipped[/yellow]")
         for entry in malformed[:5]:
-            console.print(f"    [dim]• {entry['path']}[/dim]")
+            console.print(path_line("    • ", entry["path"], style="dim"))
         if len(malformed) > 5:
             console.print(f"    [dim]… and {len(malformed) - 5} more[/dim]")
     skipped = results.get("skipped", [])
@@ -684,8 +685,12 @@ def _report_health(
         )
         for row in subdirectory_mismatches[:10]:
             console.print(
-                f"  • {row['kb']}/{row['id']} (type={row['type']}):"
-                f" expected '{row['declared_subdirectory']}/', found '{row['actual_path']}/'"
+                path_line(
+                    f"  • {row['kb']}/{row['id']} (type={row['type']}): expected '",
+                    row["declared_subdirectory"],
+                    "/', found '",
+                )
+                + path_line("", row["actual_path"], "/'")
             )
         if len(subdirectory_mismatches) > 10:
             console.print(f"  ... and {len(subdirectory_mismatches) - 10} more")
@@ -696,7 +701,7 @@ def _report_health(
             " frontmatter (skipped — fix the YAML to index them):[/yellow]"
         )
         for row in malformed_frontmatter[:10]:
-            console.print(f"  • {row['kb']}: {row['path']} — {row['error']}")
+            console.print(path_line(f"  • {row['kb']}: ", row["path"], f" — {row['error']}"))
         if len(malformed_frontmatter) > 10:
             console.print(f"  ... and {len(malformed_frontmatter) - 10} more")
 
@@ -723,7 +728,9 @@ def _report_health(
             "cannot model (no update reaches them; fix the key by hand):[/yellow]"
         )
         for row in unmodellable_frontmatter[:10]:
-            console.print(f"  • {row['kb']}: {row['path']}:{row['line']} — {row['reason']}")
+            console.print(
+                path_line(f"  • {row['kb']}: ", row["path"], f":{row['line']} — {row['reason']}")
+            )
         if len(unmodellable_frontmatter) > 10:
             console.print(f"  ... and {len(unmodellable_frontmatter) - 10} more")
 

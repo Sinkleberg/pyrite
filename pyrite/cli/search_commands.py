@@ -8,9 +8,10 @@ import logging
 import os
 
 import typer
-from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+
+from pyrite.cli.output import cli_console
 
 from ..config import load_config
 from ..exceptions import QuerySyntaxError, QueryTooLongError, StorageError, ValidationError
@@ -28,10 +29,10 @@ from .output import validate_output_format
 
 logger = logging.getLogger(__name__)
 
-console = Console()
+console = cli_console()
 # Status/progress chatter goes here so it never pollutes stdout in machine
 # formats (-f json etc.), where stdout must be valid parseable output only.
-err_console = Console(stderr=True)
+err_console = cli_console(stderr=True)
 
 
 def _warn_if_stale(config, db, kb_name: str | None) -> None:

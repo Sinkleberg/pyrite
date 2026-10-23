@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from rich.console import Console
+
+from pyrite.cli.output import cli_console, path_line
 
 from ..config import load_config
 from ..services.index_backup import backup_index
@@ -21,7 +22,7 @@ from ..utils.errors import cli_error
 logger = logging.getLogger(__name__)
 
 db_app = typer.Typer(help="Database backup and restore.")
-console = Console()
+console = cli_console()
 
 
 @db_app.command("backup")
@@ -59,7 +60,7 @@ def db_backup(
     # soft_wrap: a long path must stay copy-pasteable. Rich's default wrapping
     # breaks it across lines at the console width, so the one thing the
     # operator needs from this output cannot be pasted back into a shell.
-    console.print(f"Backup created: {output_path}", soft_wrap=True)
+    console.print(path_line("Backup created: ", output_path), soft_wrap=True)
 
 
 @db_app.command("restore")

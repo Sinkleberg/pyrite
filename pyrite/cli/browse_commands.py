@@ -7,8 +7,9 @@ Commands: list-entries, batch-read, orient, recent, timeline, tags, backlinks
 from __future__ import annotations
 
 import typer
-from rich.console import Console
 from rich.table import Table
+
+from pyrite.cli.output import cli_console
 
 from ..exceptions import PyriteError
 from ..services.access_policy import UNSCOPED
@@ -16,7 +17,7 @@ from ..services.read_shaping import parse_cli_fields, project_fields
 from .context import cli_context, require_kb
 from .output import validate_output_format
 
-console = Console()
+console = cli_console()
 
 
 def _format_output(data: dict, fmt: str, **kwargs) -> str | None:
