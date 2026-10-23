@@ -512,10 +512,11 @@ community needs and feedback.
 
 | Release | Promise | Leaves |
 |---|---|---|
-| 0.25.7 | The first hour works; the alpha announcement | 2026-10-08 |
-| 0.25.8 | The CLI contract for agents | 2026-10-15 |
-| 0.25.9 | Search reads the whole entry; links work across KBs | 2026-10-22 |
-| 0.26 | Your files, exactly | undated |
+| 0.25.7 | The first hour works; the alpha announcement (shipped) | 2026-10-13 |
+| 0.25.8 | The CLI contract for agents (shipped) | 2026-10-16 |
+| 0.25.9 | Search reads the whole entry; links work across KBs (not cut as its own release; see below) | not released |
+| 0.26 | Your files, exactly (shipped) | 2026-10-22 |
+| 0.26.1 | The patch release after 0.26.0; its issues are the GitHub `0.26.1` milestone | undated |
 | 0.27 | One operator, many users | undated |
 | 0.28 | Alpha plugin and API contracts | undated |
 
@@ -531,11 +532,20 @@ milestones carry the issues; this table carries the promise and the gate.
   error spelling (#610), create (#86), the echo rule against the file (#569),
   tiers in tool descriptions (#68), `.claude/` by audience (#244). Left open
   for contributors: #54, #52, #59, #572, #200.
-- **0.25.9.** Whole-entry passage embedding
+- **0.25.9.** No `0.25.9` tag or release exists; 0.25.8 was followed by 0.26.0.
+  The promise below is kept for the reasoning, and what shipped is in the
+  [0.26.0] CHANGELOG entry. Whole-entry passage embedding
   ([[embed-the-whole-entry-in-passages-by-default]]), #594, #194, #627; links
   and cross-KB reads (#62, #64, #124, #621, #622, #623, #468). Embedding lands
   before the index reconcile (maintainer, 2026-10-02).
-- **0.26: your files, exactly.** First the index tells the truth: the ADR-0038
+- **0.26: your files, exactly (shipped 2026-10-22).** It delivered: the index
+  keeps one link row per link a file writes and `index health` lists what it
+  cannot read; a write changes only what was asked (ADR-0042, ADR-0051), so
+  comments, key order, quoting and line endings stay as written; one resolver
+  answers "which KB" on every surface, and a shortname is link syntax only.
+  The cascade extension, the built-in public site and the Streamlit UI are
+  removed. See CHANGELOG `[0.26.0]` for the full list. The plan as written:
+  First the index tells the truth: the ADR-0038
   reconcile (#6, #7, #484 to #487, #495, #51, #22), identity (#639, #494, #488
   to #490), health (#593). Then a write changes only what was asked (ADR-0042,
   accepted 2026-10-03; its rule is re-spiked on the real path first): #637, #638, #640,
@@ -548,6 +558,11 @@ milestones carry the issues; this table carries the promise and the gate.
   per KB by grant; everything else belongs to the operator. Capabilities
   granted by the operator and configured in a user-owned file are the
   direction, not this release.
+  *Already delivered by 0.26.0:* one landing rule decides where a signed-in
+  user's write lands, on every REST route and MCP tool, and a write to a KB
+  entry stays inside the KB root. *Remaining:* the authorization model and
+  its executable matrix (#587), the security review (#586), the one KB
+  registry (ADR-0039) and the `published` flag.
 - **0.28: alpha plugin and API contracts.** Plugins out of tree with
   journalism-investigation as the pilot, where its tools are fixed (#92, #93,
   #94, #98); identity injected by the dispatcher (#384); #385, #412, #456,
@@ -555,10 +570,11 @@ milestones carry the issues; this table carries the promise and the gate.
 
 The sections below for 0.25.7 to 0.25.9, 0.26 and 0.27 predate this line.
 Where they differ, this section wins; their detail is kept for the reasoning.
+0.25.7, 0.25.8 and 0.26.0 are shipped.
 
 ---
 
-## 0.25.7 to 0.25.9 — Agents in the terminal (next; weekly patch releases)
+## 0.25.7 to 0.25.9 — Agents in the terminal (superseded by the release line; kept for reasoning)
 
 **Decided 2026-10-01 (maintainer).** The work a new user tests first comes before the
 multi-user review: Claude Code and terminal integration, and MCP on a local install.
@@ -612,7 +628,7 @@ index match the files and reports duplicates, pinned by invariant tests.
   `embed-the-whole-entry-in-passages-by-default`, on the evidence of the embedding spike.
   It changes the index, so it needs a groom and probably an ADR first.
 
-## 0.26 — Multi-user you can trust (after 0.25.9; still alpha)
+## 0.26 — Multi-user you can trust (superseded by the release line; kept for reasoning)
 
 **Sequencing (2026-10-01):** grooming for the review starts in parallel with the 0.25.x
 releases, at a low rate; the build starts after 0.25.9. Target November, no fixed date.
@@ -773,7 +789,7 @@ maintainer.
 
 ---
 
-## 0.27 — Direction (maintainer decisions, 2026-09-26; not yet groomed)
+## 0.27 — Direction (superseded by the release line; kept for reasoning; plugins out of tree moved to 0.28)
 
 - **ADR-0037 themes 3b–5:** writes and MCP go through the one policy point.
 - **CodeQL advanced setup (#228).**
