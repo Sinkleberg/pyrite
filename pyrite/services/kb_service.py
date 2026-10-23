@@ -310,6 +310,20 @@ def _same_target(existing: Any, target: str) -> bool:
     return bool(as_stored_text(existing) == as_stored_text(target))
 
 
+def _load_warnings(problems: list[dict[str, str]]) -> list[dict[str, Any]]:
+    """Warnings for fields the file's type loader refuses and a write left alone
+    (ADR-0042 decision 8): the field, and the loader's own message."""
+    return [
+        {
+            "field": p["field"],
+            "rule": "load",
+            "severity": "warning",
+            "message": f"{p['field']}: {p['error']}",
+        }
+        for p in problems
+    ]
+
+
 @dataclass
 class WriteResult:
     """What a write produced: the saved entry and the schema warnings it drew.
@@ -1006,7 +1020,13 @@ class KBService:
             return None
         path, digest, entry = found
         try:
-            return self._index_mgr.read_fields(entry, kb_name, path, content_hash=digest, row=row)
+            result = self._index_mgr.read_fields(entry, kb_name, path, content_hash=digest, row=row)
+            if entry.load_problems:
+                # The file is of the type it declares, but its loader refused
+                # these fields (left out of the fields above): the read says
+                # so rather than saying "not found" (ADR-0042 decisions 8, 9).
+                result["load_problems"] = list(entry.load_problems)
+            return result
         except TypeError as exc:
             # A file with no readable fields: a tagged or complex key, or a
             # value JSON cannot hold (a `!!set`). Refused, not a traceback
@@ -1059,7 +1079,7 @@ class KBService:
                 continue
             try:
                 # One read: the entry is parsed from the bytes that are hashed.
-                entry = repo.load_entry_from_bytes(path, raw)
+                entry = repo.load_entry_from_bytes(path, raw, partial=True)
             except Exception as exc:
                 # A file the loader refuses (a duplicate key, a root that is
                 # no mapping) is the unmodellable refusal, not a miss (#1035).
@@ -1945,7 +1965,7 @@ class KBService:
             path, raw = found
             _refuse_unmodellable(raw, entry_id, "update")
             try:
-                entry = repo.load_entry_from_bytes(path, raw)
+                entry = repo.load_entry_from_bytes(path, raw, partial=True)
             except Exception as e:
                 logger.warning("Could not load %s: %s", path, e)
                 raise EntryNotFoundError(
@@ -2004,15 +2024,27 @@ class KBService:
                 warnings = self._validate_write(
                     entry, kb_name, kb_config, before=before, existing_entry=entry
                 )
+                warnings.extend(_load_warnings(entry.load_problems))
                 return WriteResult(entry=entry, warnings=warnings, changed=False)
 
             new_bytes = new_text.encode("utf-8")
             try:
-                new_entry = repo.load_entry_from_bytes(path, new_bytes)
+                new_entry = repo.load_entry_from_bytes(path, new_bytes, partial=True)
             except Exception as e:
                 raise ValidationError(
                     f"Cannot update '{entry_id}': the result would not load ({e})"
                 ) from e
+            # A field the loader refuses and the write leaves as it was is a
+            # warning (ADR-0042 decision 8); one the write sets, or one the
+            # write newly breaks, is a refusal: the result must not be worse.
+            new_values = load_yaml(split_frontmatter(new_text).text) or {}
+            for problem in new_entry.load_problems:
+                key = problem["field"]
+                if key not in file_values or new_values.get(key) != file_values[key]:
+                    raise ValidationError(
+                        f"Cannot update '{entry_id}': the result would not load "
+                        f"({key}: {problem['error']})"
+                    )
             # Refuse a transition into claimed, not edits which preserve an
             # existing claim after its children have since finished.
             if (
@@ -2029,6 +2061,7 @@ class KBService:
             warnings = self._validate_write(
                 new_entry, kb_name, kb_config, before=before, existing_entry=entry
             )
+            warnings.extend(_load_warnings(new_entry.load_problems))
             extra = {"old_status": old_status} if old_status else {}
             hook_ctx = self._hook_ctx(kb_name, kb_config, "update", extra)
             # A before_save hook may refuse (raise); its return value is
@@ -2036,10 +2069,12 @@ class KBService:
             # it changes in place is this write's index row, until the next
             # sync (P6 replaces that with an index-time derivation).
             self._run_hooks("before_save", new_entry, hook_ctx)
+            row: dict[str, Any] | None = None
             try:
-                row = self._index_mgr.row_for(
-                    new_entry, kb_name, path, content_hash=content_hash(new_bytes)
-                )
+                if not new_entry.load_problems:
+                    row = self._index_mgr.row_for(
+                        new_entry, kb_name, path, content_hash=content_hash(new_bytes)
+                    )
             except ValueError as e:
                 raise ValidationError(
                     f"Cannot update '{entry_id}': the result cannot be indexed ({e})"
@@ -2071,16 +2106,20 @@ class KBService:
         path, not_moved = self._templated_move(
             repo, kb_config, new_entry, path, new_text, file_values
         )
-        row["file_path"] = str(path)
-        self.db.register_kb(
-            name=kb_name,
-            kb_type=kb_config.kb_type,
-            path=str(kb_config.path),
-            description=kb_config.description,
-        )
-        self._index_mgr.index_row(row, path)
-        self._auto_embed(new_entry.id, kb_name)
-        self._run_hooks("after_save", new_entry, hook_ctx)
+        if row is not None:
+            row["file_path"] = str(path)
+            self.db.register_kb(
+                name=kb_name,
+                kb_type=kb_config.kb_type,
+                path=str(kb_config.path),
+                description=kb_config.description,
+            )
+            self._index_mgr.index_row(row, path)
+            self._auto_embed(new_entry.id, kb_name)
+            self._run_hooks("after_save", new_entry, hook_ctx)
+        # else: the file still holds a field its loader refuses. It is written
+        # as the update made it, has no row (the reconcile lists it as
+        # malformed) and the warning says which field.
         return WriteResult(
             entry=new_entry, warnings=warnings, changed=True, locked=locked, not_moved=not_moved
         )
@@ -2668,6 +2707,13 @@ class KBService:
         repo = KBRepository(kb_config)
         entry = repo.load(source_id)
         if not entry:
+            if repo.find_file(source_id) is not None:
+                # The file is there; its type cannot load it. Links are written
+                # from the loaded model, so say so instead of "not found".
+                raise ValidationError(
+                    f"Cannot link from '{source_id}': its file does not load as the type "
+                    f"it declares (`pyrite get {source_id}` names the field)"
+                )
             raise EntryNotFoundError(f"Entry not found: {source_id}")
 
         tkb = target_kb or source_kb
@@ -2687,7 +2733,9 @@ class KBService:
             """
             if self.db.get_entry(target_id, tkb) is not None:
                 return True
-            return target_repo.load(target_id) is not None
+            # The file exists whether or not its type loads: a link to it is
+            # not a link to nothing (#1261).
+            return target_repo.find_file(target_id) is not None
 
         # Duplicates are checked before the target is validated: re-issuing a
         # link already recorded in the source's frontmatter must stay a no-op
@@ -3513,7 +3561,7 @@ class KBService:
         kb_config = self.require_kb(kb_name)
         if self.db.get_entry(entry_id, kb_name) is not None:
             return
-        if KBRepository(kb_config).load(entry_id) is not None:
+        if KBRepository(kb_config).find_file(entry_id) is not None:  # exists, loadable or not
             return
         # A link to a page that does not exist yet is stored and answered (a
         # red link, `[[ghost-page]]`): the subject is absent, but the question

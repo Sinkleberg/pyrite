@@ -206,15 +206,10 @@ def test_repository_reads_every_row_as_the_splitter_does(repo, tmp_path, case):
         with pytest.raises(FrontmatterError):
             repo._load_entry(_write(tmp_path, text))
         return
-    if not yaml_text.strip():
-        # An empty frontmatter declares no type, id or title: refused, never
-        # an event with the hash-of-nothing id every such file shared (#1261).
-        with pytest.raises(FrontmatterError, match="empty"):
-            repo._load_entry(_write(tmp_path, text))
-        return
     entry = repo._load_entry(_write(tmp_path, text))
     assert entry.body == body
-    # A mapping with no `type:` loads as a note.
+    # A mapping with no `type:` loads as a note, and so does an empty one: the
+    # type the loader dispatches an untyped file to, never an event (#1261).
     assert type(entry).__name__ == "NoteEntry"
 
 

@@ -275,10 +275,19 @@ def export_site(
 
         # Load full Entry objects from disk
         entries = []
+        unloadable = 0
         for row in raw_entries:
             entry = _load_entry_from_result(row, svc, kb)
             if entry:
                 entries.append(entry)
+            else:
+                unloadable += 1
+        if unloadable:
+            # A file that stopped loading since the last sync is left out, and
+            # said so: it was never exported as another type (#1261).
+            console.print(
+                f"[yellow]{unloadable} entr(ies) could not be loaded and are not exported.[/yellow]"
+            )
 
         if not entries:
             console.print("[yellow]No entries could be loaded.[/yellow]")
@@ -320,7 +329,8 @@ def _entry_from_file(path):
     split = split_frontmatter(path.read_text(encoding="utf-8"))
     if not isinstance(split, Frontmatter):
         return None
-    entry = entry_from_frontmatter(load_yaml(split.text), split.body)
+    # An empty frontmatter is an empty mapping, a note, as the loader reads it.
+    entry = entry_from_frontmatter(load_yaml(split.text) or {}, split.body)
     entry.file_path = path
     return entry
 

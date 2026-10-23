@@ -356,16 +356,28 @@ class KBRepository:
         # to the correct type based on entry_type field
         return Entry
 
-    def _load_entry(self, file_path: Path, text: str | None = None) -> Entry:
+    def _load_entry(
+        self, file_path: Path, text: str | None = None, *, partial: bool = False
+    ) -> Entry:
         """Load an entry from a file as the type its frontmatter declares.
 
         ``text``: the file's text, already read (``load_entry_from_bytes``);
         read here when None.
 
+        ``partial``: for a reader or an in-place edit that must reach a file
+        its type cannot fully load (ADR-0042 decisions 8 and 9: a problem in
+        a field the write does not touch is a warning). A type loader that
+        raises on some fields then gives an entry of the DECLARED type built
+        without them, with ``entry.load_problems`` naming each field and the
+        loader's message (``_without_refused_fields``). Never another type,
+        and never to be saved from the model: it is for reading and for
+        resolving a byte-level patch. When no field alone explains the
+        failure it raises as without ``partial``.
+
         Returns an entry of the declared type, or raises. A read error
         (``OSError``, ``UnicodeError``) propagates as itself, so the reconcile
         can tell an unreadable file from one with bad content. Frontmatter
-        that is missing, does not parse, is not a mapping or is empty raises
+        that is missing, does not parse or is not a mapping raises
         ``FrontmatterError``; a type loader that raises is ``EntryLoadError``
         naming the file and the declared type. No path substitutes another
         type: this used to fall back to ``EventEntry`` of the same file, which
@@ -379,10 +391,10 @@ class KBRepository:
             if not isinstance(split, Frontmatter):
                 raise FrontmatterError(f"Invalid entry format: {describe(split)}")
             fm = load_yaml(split.text)
-            if not fm or not isinstance(fm, dict):
-                # No type, no id, no title (`---\n---`): the event fallback
-                # gave every such file the same id, `entry-da39a3ee` (#639).
-                raise FrontmatterError("Invalid entry format: the frontmatter is empty")
+            if fm is None:
+                fm = {}  # `---\n---` and `null`: an empty mapping, as `read_entry_id` reads it
+            if not isinstance(fm, dict):
+                raise FrontmatterError("Invalid entry format: the frontmatter is not a mapping")
             body = split.body
             try:
                 fm = self._maybe_migrate(fm)
@@ -399,11 +411,15 @@ class KBRepository:
                 raise
             except Exception as e:
                 declared = fm.get("type")
-                raise EntryLoadError(
+                error = EntryLoadError(
                     str(e) or type(e).__name__,
                     path=file_path,
                     entry_type=str(declared) if declared else None,
-                ) from e
+                )
+                error.__cause__ = e
+                if not partial:
+                    raise error from e
+                entry = self._without_refused_fields(fm, body, error)
         except FrontmatterError as e:
             # One line, never a traceback: per-file tracebacks drowned bulk
             # sync output (Tier A 1080); the reconcile reports the file under
@@ -417,6 +433,33 @@ class KBRepository:
                 entry.metadata = {}
             if "references" not in entry.metadata:
                 entry.metadata["references"] = fm["references"]
+        return entry
+
+    @staticmethod
+    def _without_refused_fields(fm: dict, body: str, error: EntryLoadError) -> Entry:
+        """The declared type's entry from ``fm`` without the fields its loader
+        refuses, each recorded in ``load_problems`` (``_load_entry(partial=)``).
+
+        A field is refused when the loader raises on ``type``/``id``/``title``
+        plus that field alone. Raises ``error`` when none is (the failure is in
+        the base fields or across fields) or the rest still does not load.
+        """
+        base = {k: fm[k] for k in ("type", "id", "title") if k in fm}
+        refused: dict[str, str] = {}
+        for key, value in fm.items():
+            if key in base:
+                continue
+            try:
+                entry_from_frontmatter({**base, key: value}, "")
+            except Exception as e:
+                refused[str(key)] = str(e) or type(e).__name__
+        if not refused:
+            raise error
+        try:
+            entry = entry_from_frontmatter({k: v for k, v in fm.items() if k not in refused}, body)
+        except Exception:
+            raise error from None
+        entry.load_problems = [{"field": k, "error": m} for k, m in refused.items()]
         return entry
 
     def _maybe_migrate(self, fm: dict) -> dict:
@@ -1240,13 +1283,15 @@ class KBRepository:
                 continue
             yield yaml_file
 
-    def load_entry_from_bytes(self, file_path: Path, raw: bytes) -> Entry:
+    def load_entry_from_bytes(self, file_path: Path, raw: bytes, *, partial: bool = False) -> Entry:
         """``load_entry_from_file`` of ``raw``, the file's bytes as already read.
 
         For a reader that must name the bytes it parsed (a single-entry read
         and its ``content_hash``, ADR-0042 decision 9): the text is decoded as
         ``read_text`` decodes it -- UTF-8, universal newlines -- so the entry
-        is the one a read of the file would give. Raises on parse failure.
+        is the one a read of the file would give. Raises on parse failure; with
+        ``partial``, a type loader's refusal of some fields does not
+        (``_load_entry``).
         """
         text = _text_of(raw)
         if file_path.name == "__collection.yaml":
@@ -1254,7 +1299,7 @@ class KBRepository:
             folder_path = str(file_path.parent.relative_to(self.path))
             entry: Entry = CollectionEntry.from_collection_yaml(data, folder_path)
         else:
-            entry = self._load_entry(file_path, text)
+            entry = self._load_entry(file_path, text, partial=partial)
         entry.kb_name = self.name
         entry.file_path = file_path
         return entry

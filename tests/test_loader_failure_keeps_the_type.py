@@ -27,7 +27,7 @@ import pytest
 from pyrite.config import KBConfig
 from pyrite import exceptions
 from pyrite.exceptions import FrontmatterError, ValidationError
-from pyrite.models.core_types import ENTRY_TYPE_REGISTRY
+from pyrite.models.core_types import ENTRY_TYPE_REGISTRY, read_entry_id
 from pyrite.plugins import get_registry
 from pyrite.storage.repository import KBRepository
 
@@ -148,15 +148,18 @@ def test_a_valid_file_of_each_type_still_loads_as_its_type(repo, monkeypatch, en
     ["---\n---\n\nBody\n", "---\n{}\n---\n\nBody\n", "---\nnull\n---\n\nBody\n"],
     ids=["empty", "empty-mapping", "null"],
 )
-def test_frontmatter_with_nothing_in_it_is_unreadable_not_an_event(repo, text):
-    # It declares no type, no id and no title: the id the event fallback gave
-    # it (`entry-da39a3ee`, the hash of nothing) was shared by every such file
-    # (#639). Malformed until a path-addressed id exists (#730 P7a).
+def test_frontmatter_with_nothing_in_it_loads_as_a_note_like_any_untyped_file(repo, text):
+    # An empty mapping is a note, exactly as `foo: bar` is, and with the id
+    # `read_entry_id` reports for it. Hand-kept KBs depend on it (design
+    # principle 5; ADR-0038, ADR-0042); the shared derived id (#639) is the
+    # path-addressed id's to fix (#730 P7a), not a reason to drop the file.
     path = repo.path / "empty.md"
     path.write_text(text, encoding="utf-8")
 
-    with pytest.raises(FrontmatterError, match="empty"):
-        repo._load_entry(path)
+    entry = repo._load_entry(path)
+
+    assert entry.entry_type == "note"
+    assert entry.id == read_entry_id(text) == "entry-da39a3ee"
 
 
 # -- the reconcile and its typed rows ----------------------------------------
@@ -267,7 +270,8 @@ def test_the_cli_reports_the_file_and_the_typed_view_does_not_show_an_event(
     sync = world.cli("index", "sync")
     assert sync.exit_code == 0, sync.output
     assert "Malformed: 1 file(s) skipped" in sync.output
-    assert "bad.md" in sync.output
+    # The path is asserted on `index health --format json` below: Rich wraps a
+    # long path in the human output, so a substring check on it fails on CI.
 
     health = world.cli("index", "health", "--format", "json")
     report = json.loads(health.stdout)
@@ -304,3 +308,198 @@ def test_an_update_whose_result_would_not_load_is_refused_not_written(
     assert "status must be one of" in result.output
     assert path.read_bytes() == before
     assert world.db.get_entry("good", "sw")["entry_type"] == "backlog_item"
+
+
+# -- what dev could load, the loader still loads (ADR-0042 decisions 8 and 9) --
+#
+# The property: loading a file never loses an entry that dev could load and
+# repair, and never retypes one. Six frontmatter shapes, each through the
+# entry points a user meets: the reconcile and search, `get`, and `update`.
+
+_BODY = "Zebra marker body.\n"
+
+#: shape -> (file text, id, loads). `loads`: the loader gives a typed entry.
+FILES = {
+    "empty": (f"---\n---\n\n{_BODY}", "entry-da39a3ee", True),
+    "foo-bar": (f"---\nfoo: bar\n---\n\n{_BODY}", "entry-da39a3ee", True),
+    "tags": (f"---\ntags: [a]\n---\n\n{_BODY}", "entry-da39a3ee", True),
+    "bad-int": (
+        f"---\ntype: backlog_item\nid: bad\ntitle: Bad\nrank: abc\n---\n\n{_BODY}",
+        "bad",
+        False,
+    ),
+    "inf": (
+        f"---\ntype: backlog_item\nid: bad\ntitle: Bad\nrank: .inf\n---\n\n{_BODY}",
+        "bad",
+        False,
+    ),
+    # No loader in the tree raises on a bad date (dates are read leniently), so
+    # this one loads on dev and on the head alike: a control for the shape.
+    "bad-date": (
+        f"---\ntype: note\nid: bad\ntitle: Bad\ncreated_at: not-a-date\n---\n\n{_BODY}",
+        "bad",
+        True,
+    ),
+}
+UNLOADABLE = [n for n, (_, _, loads) in FILES.items() if not loads]
+UNDECLARED = ["empty", "foo-bar", "tags"]  # no `type:`: a note, the id from the empty title
+
+
+def _params(names, green_on_the_old_head):
+    """``names`` as parameters; the shapes the round-0 head already handled are
+    controls (they guard the property but cannot be red against that head)."""
+    control = pytest.mark.control(
+        reason="the round-0 head already handled this shape; it guards the property"
+    )
+    return [pytest.param(n, marks=control if n in green_on_the_old_head else ()) for n in names]
+
+
+FILE_PARAMS_RECONCILE = _params(FILES, {"foo-bar", "tags", "bad-date", "bad-int", "inf"})
+FILE_PARAMS_GET = _params(FILES, {"foo-bar", "tags", "bad-date"})
+UNDECLARED_PARAMS = _params(UNDECLARED, {"foo-bar", "tags"})
+
+
+def _sw_world(cli_world, tmp_path, name):
+    world = cli_world(kbs=[KBConfig(name="sw", path=tmp_path / "sw", kb_type="software")])
+    path = world.kb_path("sw") / "f.md"
+    path.write_text(FILES[name][0], encoding="utf-8")
+    return world, path
+
+
+@pytest.mark.parametrize("name", FILE_PARAMS_RECONCILE)
+def test_the_reconcile_indexes_what_loads_and_reports_what_does_not(cli_world, tmp_path, name):
+    world, path = _sw_world(cli_world, tmp_path, name)
+    _, entry_id, loads = FILES[name]
+
+    sync = world.cli("index", "sync")
+    assert sync.exit_code == 0, sync.output
+
+    row = world.db.get_entry(entry_id, "sw")
+    health = json.loads(world.cli("index", "health", "--format", "json").stdout)
+    malformed = [r for r in health["checks"]["malformed_frontmatter"] if r["path"] == str(path)]
+    if loads:
+        assert row is not None, "an entry dev could load is missing from the index"
+        assert row["entry_type"] == "note"
+        assert malformed == []
+        found = world.db.search("Zebra", kb_name="sw")
+        assert [r["id"] for r in found] == [entry_id], found
+    else:
+        assert row is None
+        assert len(malformed) == 1, health["checks"]["malformed_frontmatter"]
+        assert world.db.list_entries(kb_name="sw") == []
+
+
+@pytest.mark.parametrize("name", FILE_PARAMS_GET)
+def test_get_returns_the_file_never_not_found(cli_world, tmp_path, name):
+    world, _ = _sw_world(cli_world, tmp_path, name)
+    _, entry_id, loads = FILES[name]
+
+    got = world.cli("get", entry_id, "-k", "sw", "--format", "json")
+
+    assert got.exit_code == 0, got.output
+    data = json.loads(got.stdout)
+    assert data["id"] == entry_id
+    assert "Zebra marker" in (data.get("body") or "")
+    if loads:
+        assert data["entry_type"] == "note"
+        assert not data.get("load_problems")
+    else:
+        # The declared type, with the loader's own message; never an event.
+        assert data["entry_type"] == "backlog_item"
+        problems = data["load_problems"]
+        assert len(problems) == 1, problems
+        assert problems[0]["field"] == "rank"
+        assert problems[0]["error"]
+
+
+@pytest.mark.parametrize("name", UNLOADABLE)
+def test_an_update_that_fixes_the_bad_field_succeeds_and_repairs_the_file(
+    cli_world, tmp_path, name
+):
+    world, path = _sw_world(cli_world, tmp_path, name)
+    before = path.read_text(encoding="utf-8")
+
+    result = world.cli("update", "bad", "-k", "sw", "-f", "rank=3")
+
+    assert result.exit_code == 0, result.output
+    old_rank = "rank: abc" if name == "bad-int" else "rank: .inf"
+    assert path.read_text(encoding="utf-8") == before.replace(old_rank, "rank: 3")
+    world.cli("index", "sync")
+    assert world.db.get_entry("bad", "sw")["entry_type"] == "backlog_item"
+
+
+@pytest.mark.parametrize("name", UNLOADABLE)
+def test_an_update_of_another_field_succeeds_with_a_warning_and_leaves_the_bad_one(
+    cli_world, tmp_path, name
+):
+    # ADR-0042 decision 8: a problem in a field the write does not touch is a
+    # warning, not a refusal.
+    world, path = _sw_world(cli_world, tmp_path, name)
+    before = path.read_text(encoding="utf-8")
+
+    result = world.cli("update", "bad", "-k", "sw", "-f", "title=Renamed", "--format", "json")
+
+    assert result.exit_code == 0, result.output
+    assert path.read_text(encoding="utf-8") == before.replace("title: Bad", "title: Renamed")
+    assert "rank" in result.stdout  # the warning names the field
+    assert world.db.get_entry("bad", "sw") is None  # unreadable still: no row, and no event row
+
+
+@pytest.mark.parametrize("name", UNDECLARED_PARAMS)
+def test_an_update_of_a_file_that_declares_nothing_succeeds(cli_world, tmp_path, name):
+    world, path = _sw_world(cli_world, tmp_path, name)
+
+    result = world.cli("update", FILES[name][1], "-k", "sw", "-f", "title=Named")
+
+    assert result.exit_code == 0, result.output
+    assert "title: Named" in path.read_text(encoding="utf-8")
+
+
+# -- the other callers of the loader -------------------------------------------
+
+
+def _two_files(cli_world, tmp_path):
+    world = cli_world(kbs=[KBConfig(name="sw", path=tmp_path / "sw", kb_type="software")])
+    root = world.kb_path("sw")
+    (root / "bad.md").write_text(FILES["inf"][0], encoding="utf-8")
+    (root / "ok.md").write_text(_text("backlog_item", "ok", bad=False), encoding="utf-8")
+    world.index("sw")
+    return world, root
+
+
+def test_a_link_to_a_file_that_does_not_load_is_not_a_link_to_nothing(cli_world, tmp_path):
+    world, root = _two_files(cli_world, tmp_path)
+
+    result = world.cli("link", "ok", "bad", "-k", "sw")
+
+    assert result.exit_code == 0, result.output
+    assert "bad" in (root / "ok.md").read_text(encoding="utf-8")
+
+
+def test_a_link_from_a_file_that_does_not_load_says_so_not_not_found(cli_world, tmp_path):
+    world, root = _two_files(cli_world, tmp_path)
+    before = (root / "bad.md").read_bytes()
+
+    result = world.cli("link", "bad", "ok", "-k", "sw")
+
+    assert result.exit_code != 0
+    assert "not found" not in result.output.lower()
+    assert "does not load" in result.output.replace("\n", " ")
+    assert (root / "bad.md").read_bytes() == before
+
+
+def test_export_site_includes_an_empty_frontmatter_note_and_names_what_it_cannot_load(
+    cli_world, tmp_path
+):
+    world, root = _two_files(cli_world, tmp_path)
+    (root / "empty.md").write_text(FILES["empty"][0], encoding="utf-8")
+    world.index("sw")
+    # `ok` was indexed; an edit since the sync makes its `rank` unloadable.
+    (root / "ok.md").write_text(FILES["inf"][0].replace("id: bad", "id: ok"), encoding="utf-8")
+    out = tmp_path / "site"
+
+    result = world.cli("export", "site", "-k", "sw", "-o", str(out))
+
+    assert result.exit_code == 0, result.output
+    assert "Exported 1 entries" in result.output
+    assert "could not be loaded" in result.output.replace("\n", " ")
