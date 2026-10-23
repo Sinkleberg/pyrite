@@ -356,7 +356,10 @@ def _params(names, green_on_the_old_head):
 
 FILE_PARAMS_RECONCILE = _params(FILES, {"foo-bar", "tags", "bad-date", "bad-int", "inf"})
 FILE_PARAMS_GET = _params(FILES, {"foo-bar", "tags", "bad-date"})
-UNDECLARED_PARAMS = _params(UNDECLARED, {"foo-bar", "tags"})
+UNDECLARED_PARAMS = _params(UNDECLARED, {"foo-bar", "tags", "empty"})
+#: dev repairs these too: red only against the round-0 head (5643a439), which
+#: said "not found"; they guard the property that dev's repair path survives.
+REPAIR_PARAMS = _params(UNLOADABLE, set(UNLOADABLE))
 
 
 def _sw_world(cli_world, tmp_path, name):
@@ -412,7 +415,7 @@ def test_get_returns_the_file_never_not_found(cli_world, tmp_path, name):
         assert problems[0]["error"]
 
 
-@pytest.mark.parametrize("name", UNLOADABLE)
+@pytest.mark.parametrize("name", REPAIR_PARAMS)
 def test_an_update_that_fixes_the_bad_field_succeeds_and_repairs_the_file(
     cli_world, tmp_path, name
 ):
