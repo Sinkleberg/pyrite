@@ -57,10 +57,7 @@ def db_backup(
 
     backup_index(db_path, output_path)
 
-    # soft_wrap: a long path must stay copy-pasteable. Rich's default wrapping
-    # breaks it across lines at the console width, so the one thing the
-    # operator needs from this output cannot be pasted back into a shell.
-    console.print(path_line("Backup created: ", output_path), soft_wrap=True)
+    console.print(path_line("Backup created: ", output_path))
 
 
 @db_app.command("restore")
@@ -106,4 +103,4 @@ def db_restore(
     # Copy the backup over the current database
     shutil.copy2(str(backup), str(db_path))
 
-    console.print(f"Restored database from {backup}")
+    console.print(path_line("Restored database from ", backup))

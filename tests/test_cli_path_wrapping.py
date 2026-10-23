@@ -1,6 +1,9 @@
 """Paths remain copyable in narrow terminals and captured CLI output (#1291)."""
 
 import ast
+import sqlite3
+import subprocess
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -37,6 +40,72 @@ def test_index_sync_malformed_path_stays_on_bullet_line(cli_world, narrow_termin
     assert result.exit_code == 0, result.output
     assert "Malformed: 1 file(s) skipped" in result.output
     assert f"    • {malformed}" in result.output.splitlines()
+
+
+def test_kb_commit_file_path_stays_literal(cli_world, narrow_terminal):
+    world = cli_world()
+    kb_path = world.kb_path("test-kb")
+    for args in (
+        ("init",),
+        ("config", "user.name", "Synthetic Test"),
+        ("config", "user.email", "test@example.invalid"),
+    ):
+        subprocess.run(["git", *args], cwd=kb_path, check=True, capture_output=True, timeout=30)
+    filename = (Path("long-folder-" * 9) / "[draft] changed note.md").as_posix()
+    assert len(filename) > 120
+    content = "---\nid: note\ntitle: Note\ntype: note\n---\nBody\n"
+    world.add_entry("test-kb", content, filename=filename)
+
+    result = world.cli("kb", "commit", "-k", "test-kb", "-m", "Synthetic path test")
+
+    assert result.exit_code == 0, result.output
+    assert f"  {filename}" in result.output.splitlines()
+    committed = subprocess.run(
+        ["git", "show", f"HEAD:{filename}"],
+        cwd=kb_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert committed.stdout == content
+
+
+def test_db_restore_backup_path_stays_literal(cli_world, tmp_path, narrow_terminal):
+    world = cli_world()
+    backup = tmp_path / ("long-folder-" * 8) / "[old] restore copy.db"
+    backup.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(backup)) as connection:
+        connection.execute("CREATE TABLE proof (value TEXT)")
+        connection.execute("INSERT INTO proof VALUES ('restored')")
+        connection.commit()
+    # Restore owns the database file; close the world's handle before replacing it.
+    world.db.close()
+
+    result = world.cli("db", "restore", str(backup), "--force")
+
+    assert result.exit_code == 0, result.output
+    assert f"Restored database from {backup}" in result.output.splitlines()
+    with closing(sqlite3.connect(world.config.settings.index_path)) as connection:
+        assert connection.execute("SELECT value FROM proof").fetchone() == ("restored",)
+
+
+@pytest.mark.control(reason="Preserve literal helper output and surrounding label styles")
+@pytest.mark.parametrize("path", [Path("[x]"), "C:\\", Path("folder with spaces"), "/a/b[/dim]/c"])
+def test_path_line_preserves_literal_characters_and_label_styles(path, narrow_terminal):
+    from pyrite.cli.output import cli_console, path_line
+
+    console = cli_console()
+    line = path_line("[bold]Path:[/bold] ", path, " [dim](saved)[/dim]", path_style="cyan")
+    expected = f"Path: {path} (saved)"
+
+    assert line.plain == expected
+    with console.capture() as captured:
+        console.print(line)
+    assert captured.get() == expected + "\n"
+    assert line.get_style_at_offset(console, 0).bold
+    assert line.get_style_at_offset(console, len("Path: ")).color.name == "cyan"
+    assert line.get_style_at_offset(console, len(expected) - 1).dim
 
 
 @pytest.mark.control(reason="Preserve the literal Windows root path while fixing wrapping")

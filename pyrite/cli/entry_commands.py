@@ -25,8 +25,6 @@ from typing import Any
 import typer
 from rich.console import Console
 
-from pyrite.cli.output import cli_console
-
 from ..exceptions import (
     AmbiguousEntryError,
     EntryNotFoundError,
@@ -48,7 +46,7 @@ from ..utils.frontmatter import (
 )
 from .context import cli_context, read_input_file, require_input_file
 from .outcome import Outcome
-from .output import OUTPUT_FORMAT, validate_output_format
+from .output import OUTPUT_FORMAT, cli_console, validate_output_format
 
 logger = logging.getLogger(__name__)
 console = cli_console()
@@ -811,7 +809,7 @@ def register_entry_commands(app: typer.Typer) -> None:
                     notice = escape(
                         f"No inverse is known for '{relation}'; writing '{inverse}' on {target}."
                     )
-                    cli_console(stderr=True).print(f"[dim]{notice}[/dim]", soft_wrap=True)
+                    cli_console(stderr=True).print(f"[dim]{notice}[/dim]")
                 try:
                     inv_result = svc.add_link(
                         target, tkb, source, inverse, target_kb=kb_name, note=note

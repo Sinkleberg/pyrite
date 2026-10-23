@@ -24,6 +24,7 @@ def path_line(
 ) -> Text:
     """Style the labels while keeping every path character literal.
 
+    Use this for any path printed next to Rich markup.
     A Text value also preserves trailing backslashes, which markup escaping
     can duplicate or consume when combined with surrounding style tags.
     """

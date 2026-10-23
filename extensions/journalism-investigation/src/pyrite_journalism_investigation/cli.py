@@ -645,6 +645,7 @@ def ownership_chain(
             path_str = " -> ".join(
                 f"{n['title']} ({n['percentage']}%)" for n in reversed(chain["path"])
             )
+            # Keep the entity-title chain literal, just like a filesystem path.
             console.print(path_line(f"  {i}. ", path_str, f" -> {entity['title']}"))
             console.print(f"     Effective ownership: {chain['effective_percentage']:.1f}%")
         console.print()

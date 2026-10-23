@@ -11,10 +11,8 @@ For admin operations: pyrite-admin
 import typer
 from rich.table import Table
 
-from pyrite.cli.output import cli_console, path_line
-
 from .cli.context import open_index_db, require_kb
-from .cli.output import validate_output_format
+from .cli.output import cli_console, path_line, validate_output_format
 from .cli.search_commands import register_search_command
 from .config import current_config_file, load_config
 from .exceptions import PyriteError, refusal_fields

@@ -9,13 +9,11 @@ from __future__ import annotations
 import typer
 from rich.table import Table
 
-from pyrite.cli.output import cli_console
-
 from ..exceptions import PyriteError
 from ..services.access_policy import UNSCOPED
 from ..services.read_shaping import parse_cli_fields, project_fields
 from .context import cli_context, require_kb
-from .output import validate_output_format
+from .output import cli_console, validate_output_format
 
 console = cli_console()
 

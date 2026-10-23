@@ -10,10 +10,8 @@ from pathlib import Path
 
 import typer
 
-from pyrite.cli.output import cli_console, path_line
-
 from ..models.task import TASK_KB_PRESET
-from .output import validate_output_format
+from .output import cli_console, path_line, validate_output_format
 
 logger = logging.getLogger(__name__)
 

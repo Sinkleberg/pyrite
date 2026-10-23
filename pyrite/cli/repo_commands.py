@@ -7,11 +7,9 @@ Extended repo management: subscribe, fork, sync, unsubscribe, status.
 import typer
 from rich.table import Table
 
-from pyrite.cli.output import cli_console, path_line
-
 from ..config import load_config
 from ..utils.errors import cli_error
-from .output import validate_output_format
+from .output import cli_console, path_line, validate_output_format
 
 repo_collab_app = typer.Typer(help="Repository collaboration commands")
 console = cli_console()

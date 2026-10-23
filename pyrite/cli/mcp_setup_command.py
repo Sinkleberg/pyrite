@@ -65,11 +65,9 @@ import typer
 from rich.console import Console
 from rich.text import Text
 
-from pyrite.cli.output import cli_console
-
 from ..utils.atomic_write import atomic_write_text
 from ..utils.errors import cli_error
-from .output import format_output, validate_output_format
+from .output import cli_console, format_output, validate_output_format
 
 SERVER_NAME = "pyrite"
 CLAUDE_CODE = "claude-code"

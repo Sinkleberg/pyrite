@@ -10,8 +10,6 @@ from typing import Any
 import typer
 from rich.table import Table
 
-from pyrite.cli.output import cli_console, path_line
-
 from ..config import (
     KBConfig,
     auto_discover_kbs,
@@ -25,7 +23,7 @@ from .context import (
     open_index_for_validation,
     require_kb,
 )
-from .output import validate_output_format
+from .output import cli_console, path_line, validate_output_format
 
 kb_app = typer.Typer(help="Knowledge base management")
 console = cli_console()
@@ -597,7 +595,7 @@ def kb_commit(
                 console.print(f"  {result['files_changed']} file(s) changed")
                 if result.get("files"):
                     for f in result["files"]:
-                        console.print(f"  [dim]{f}[/dim]")
+                        console.print(path_line("  ", f, style="dim"))
             elif result.get("error") == "No changes to commit":
                 # Nothing to do is the asked-for end state, not a failure.
                 console.print("[yellow]No commit:[/yellow] No changes to commit")

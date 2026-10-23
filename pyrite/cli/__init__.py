@@ -20,8 +20,6 @@ import typer
 from rich.markup import escape
 from rich.table import Table
 
-from pyrite.cli.output import cli_console, path_line
-
 from ..config import (
     Repository,
     auto_discover_kbs,
@@ -54,7 +52,7 @@ from .init_command import init_kb
 from .kb_commands import kb_app
 from .link_commands import links_app
 from .mcp_setup_command import MCP_CHECK_OK, mcp_setup, mcp_tool_counts
-from .output import output_format_choice, validate_output_format
+from .output import cli_console, output_format_choice, path_line, validate_output_format
 from .protocol_commands import protocol_app
 from .qa_commands import qa_app
 from .repo_commands import repo_collab_app

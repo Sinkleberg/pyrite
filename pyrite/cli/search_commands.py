@@ -11,8 +11,6 @@ import typer
 from rich.markup import escape
 from rich.table import Table
 
-from pyrite.cli.output import cli_console
-
 from ..config import load_config
 from ..exceptions import QuerySyntaxError, QueryTooLongError, StorageError, ValidationError
 from ..services.read_shaping import (
@@ -25,7 +23,7 @@ from ..services.read_shaping import (
 )
 from ..utils.errors import exit_unless_whole
 from .context import get_config_with_registered_kbs, require_kb
-from .output import validate_output_format
+from .output import cli_console, validate_output_format
 
 logger = logging.getLogger(__name__)
 

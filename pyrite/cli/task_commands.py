@@ -16,14 +16,12 @@ from typing import Any
 import typer
 from rich.table import Table
 
-from pyrite.cli.output import cli_console
-
 from ..exceptions import EntryNotFoundError, ValidationError
 from ..services.access_policy import UNSCOPED
 from ..services.task_service import TaskService
 from ..storage.database import PyriteDB
 from .outcome import Outcome
-from .output import LEGACY_FORMAT_SHORT, OUTPUT_FORMAT
+from .output import LEGACY_FORMAT_SHORT, OUTPUT_FORMAT, cli_console
 
 task_app = typer.Typer(help="Task management commands")
 

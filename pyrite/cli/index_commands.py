@@ -9,11 +9,9 @@ import logging
 import typer
 from rich.table import Table
 
-from pyrite.cli.output import cli_console, path_line
-
 from ..utils.errors import PARTIAL_EXIT, cli_error, exit_unless_whole
 from .context import cli_db_context, get_config_and_db, require_kb
-from .output import validate_output_format
+from .output import cli_console, path_line, validate_output_format
 
 logger = logging.getLogger(__name__)
 

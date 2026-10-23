@@ -7,11 +7,9 @@ Commands: validate, status, assess
 import typer
 from rich.table import Table
 
-from pyrite.cli.output import cli_console
-
 from ..services.access_policy import UNSCOPED
 from .context import cli_context
-from .output import output_format_choice, validate_output_format
+from .output import cli_console, output_format_choice, validate_output_format
 
 qa_app = typer.Typer(help="Quality assurance validation and assessment")
 console = cli_console()
