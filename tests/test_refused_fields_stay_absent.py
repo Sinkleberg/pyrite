@@ -189,6 +189,9 @@ def test_an_in_process_caller_is_never_handed_a_model_with_a_default_for_a_value
     assert "rank: 3" in path.read_text(encoding="utf-8")
 
 
+@pytest.mark.control(
+    reason="a ratchet: the sites already number three; it fails when a fourth is added"
+)
 def test_the_partial_model_has_three_construction_sites():
     # A new consumer of a partial model must be read against this file's rules.
     sites = []
