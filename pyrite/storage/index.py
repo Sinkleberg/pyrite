@@ -32,7 +32,7 @@ from ..models.protocols import (
     Statusable,
     Temporal,
 )
-from ..schema.field_aliases import lift_declared_fields, read_metadata, read_view
+from ..schema.field_aliases import lift_declared_fields, read_metadata, read_view, refused_names
 from ..utils.metadata import parse_metadata
 from .database import PyriteDB
 from .errors import DISK_SUGGESTION, driver_error, is_disk_fault, storage_error_from
@@ -932,6 +932,13 @@ class IndexManager:
         result["sources"] = _read_sources(data["sources"], entry.id, kb_name, row)
         result["links"] = row.get("links", [])
         result["content_hash"] = content_hash
+        # A field the loader refused holds the type's default in the model
+        # (`rank: 0`, `status: proposed`); the file's value is not that, and
+        # nothing in the reply may say it is (ADR-0042 decision 9). It is
+        # named in `load_problems`, which `KBService` attaches.
+        for name in refused_names(entry):
+            result.pop(name, None)
+            result["metadata"].pop(name, None)
         return result
 
     # -----------------------------------------------------------------

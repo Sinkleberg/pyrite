@@ -333,6 +333,17 @@ def _plain_for_file(value: object) -> object:
     return value
 
 
+def load_problem(field_path: str, error: str) -> dict[str, str]:
+    """One refused field, in the shape of a write warning (``rule: load``), so
+    ``get``'s ``load_problems`` and an update's ``warnings`` are one thing."""
+    return {
+        "field": field_path,
+        "rule": "load",
+        "severity": "warning",
+        "message": f"{field_path}: {error}",
+    }
+
+
 class KBRepository:
     """
     File-based repository for a single knowledge base.
@@ -441,25 +452,45 @@ class KBRepository:
         refuses, each recorded in ``load_problems`` (``_load_entry(partial=)``).
 
         A field is refused when the loader raises on ``type``/``id``/``title``
-        plus that field alone. Raises ``error`` when none is (the failure is in
-        the base fields or across fields) or the rest still does not load.
+        plus that field alone; a ``metadata:`` mapping is probed key by key, so
+        ``metadata.rank`` is named as such. The refused keys are left out of
+        the frontmatter the model is built from, so the model holds the type's
+        default for them: consumers must treat a name in ``load_problems`` as
+        absent (``schema.field_aliases.refused_names``). Raises ``error`` when
+        no field alone explains the failure (the base fields, a cross-field
+        rule) or the rest still does not load.
         """
         base = {k: fm[k] for k in ("type", "id", "title") if k in fm}
         refused: dict[str, str] = {}
+        kept = dict(fm)
         for key, value in fm.items():
             if key in base:
                 continue
             try:
                 entry_from_frontmatter({**base, key: value}, "")
+                continue
             except Exception as e:
-                refused[str(key)] = str(e) or type(e).__name__
+                whole = str(e) or type(e).__name__
+            if key == "metadata" and isinstance(value, dict):
+                nested = dict(value)
+                for sub, sub_value in value.items():
+                    try:
+                        entry_from_frontmatter({**base, "metadata": {sub: sub_value}}, "")
+                    except Exception as e:
+                        refused[f"metadata.{sub}"] = str(e) or type(e).__name__
+                        del nested[sub]
+                if len(nested) < len(value):
+                    kept["metadata"] = nested
+                    continue
+            refused[str(key)] = whole
+            del kept[key]
         if not refused:
             raise error
         try:
-            entry = entry_from_frontmatter({k: v for k, v in fm.items() if k not in refused}, body)
+            entry = entry_from_frontmatter(kept, body)
         except Exception:
             raise error from None
-        entry.load_problems = [{"field": k, "error": m} for k, m in refused.items()]
+        entry.mark_load_problems([load_problem(k, m) for k, m in refused.items()])
         return entry
 
     def _maybe_migrate(self, fm: dict) -> dict:

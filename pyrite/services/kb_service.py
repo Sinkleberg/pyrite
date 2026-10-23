@@ -47,6 +47,7 @@ from ..models.factory import build_entry
 from ..plugins.context import PluginContext
 from ..schema import Link, Source
 from ..schema.enum_check import is_off_list, is_per_element
+from ..schema.field_aliases import refused_names
 from ..schema.reserved import RESERVED_FIELD_NAMES
 from ..storage.database import PyriteDB
 from ..storage.document_manager import DocumentManager
@@ -155,6 +156,9 @@ _INDEX_ONLY_KEYS = frozenset(
         "modified_by",
         "outlinks",
         "backlinks",
+        # A read of a file whose type would not fully load names the fields it
+        # left out; an update never writes that list back (#1261).
+        "load_problems",
     }
 )
 
@@ -312,16 +316,22 @@ def _same_target(existing: Any, target: str) -> bool:
 
 def _load_warnings(problems: list[dict[str, str]]) -> list[dict[str, Any]]:
     """Warnings for fields the file's type loader refuses and a write left alone
-    (ADR-0042 decision 8): the field, and the loader's own message."""
-    return [
-        {
-            "field": p["field"],
-            "rule": "load",
-            "severity": "warning",
-            "message": f"{p['field']}: {p['error']}",
-        }
-        for p in problems
-    ]
+    (ADR-0042 decision 8). ``load_problems`` already has a warning's shape
+    (``repository.load_problem``): a read's ``load_problems`` and an update's
+    ``warnings`` are the same dicts."""
+    return [dict(p) for p in problems]
+
+
+def _value_at_problem(values: Mapping[str, Any], dotted: str) -> Any:
+    """The file's value at a ``load_problems`` field (``rank``, or
+    ``metadata.rank``); a missing key is a ``KeyError``."""
+    if dotted in values:
+        return values[dotted]
+    head, _, rest = dotted.partition(".")
+    nested = values[head]
+    if not rest or not isinstance(nested, Mapping):
+        raise KeyError(dotted)
+    return _value_at_problem(nested, rest)
 
 
 @dataclass
@@ -486,6 +496,10 @@ class KBService:
         nested = fields.get("metadata")
         if isinstance(nested, dict):
             fields = {**nested, **fields}
+        # A field the loader refused holds the type's default in the model;
+        # validating that default would judge a value the file does not have.
+        for name in refused_names(entry):
+            fields.pop(name, None)
         return fields
 
     @staticmethod
@@ -550,7 +564,9 @@ class KBService:
                     "kb_schema": kb_schema,
                     "kb_type": kb_config.kb_type,
                     "_schema_version": getattr(entry, "_schema_version", 0),
-                    "existing_entry": copy.deepcopy(existing_entry),
+                    "existing_entry": copy.deepcopy(
+                        None if getattr(existing_entry, "load_problems", None) else existing_entry
+                    ),
                 },
             )
         except Exception:
@@ -1895,6 +1911,7 @@ class KBService:
             updates,
             ops=_item_operations(append, remove, unset),
             restrict=True,
+            unloadable_ok=True,
         )
 
     def apply_operations(
@@ -1923,6 +1940,7 @@ class KBService:
         restrict: bool,
         ops: list[Any] | None = None,
         merge_spellings: bool = False,
+        unloadable_ok: bool = False,
     ) -> WriteResult:
         """The one update: the request as operations applied to the file's own
         bytes (ADR-0042; #955, B6 P3a).
@@ -2017,8 +2035,13 @@ class KBService:
             # The field set as loaded, for the exception that keeps an off-list
             # enum value the update does not change (#47, #555).
             before = copy.deepcopy(self._validated_fields(entry))
-            old_status = getattr(entry, "status", None)
+            # A refused `status` is the type's default in the model, not the
+            # file's status: no hook or claim check may see it as the old one.
+            old_status = (
+                None if "status" in refused_names(entry) else getattr(entry, "status", None)
+            )
             if not changed:
+                self._refuse_unloadable_result(entry_id, entry, unloadable_ok)
                 # A request that changes nothing writes nothing (decision 3);
                 # its warnings are still the file's.
                 warnings = self._validate_write(
@@ -2037,14 +2060,24 @@ class KBService:
             # A field the loader refuses and the write leaves as it was is a
             # warning (ADR-0042 decision 8); one the write sets, or one the
             # write newly breaks, is a refusal: the result must not be worse.
-            new_values = load_yaml(split_frontmatter(new_text).text) or {}
+            new_split = split_frontmatter(new_text)
+            new_values = (
+                load_yaml(new_split.text) if isinstance(new_split, Frontmatter) else None
+            ) or {}
             for problem in new_entry.load_problems:
                 key = problem["field"]
-                if key not in file_values or new_values.get(key) != file_values[key]:
+                try:
+                    untouched = _value_at_problem(new_values, key) == _value_at_problem(
+                        file_values, key
+                    )
+                except KeyError:
+                    untouched = False
+                if not untouched:
                     raise ValidationError(
                         f"Cannot update '{entry_id}': the result would not load "
-                        f"({key}: {problem['error']})"
+                        f"({problem['message']})"
                     )
+            self._refuse_unloadable_result(entry_id, new_entry, unloadable_ok)
             # Refuse a transition into claimed, not edits which preserve an
             # existing claim after its children have since finished.
             if (
@@ -2068,7 +2101,8 @@ class KBService:
             # ignored and nothing it does reaches the file (decision 4). What
             # it changes in place is this write's index row, until the next
             # sync (P6 replaces that with an index-time derivation).
-            self._run_hooks("before_save", new_entry, hook_ctx)
+            if not new_entry.load_problems:  # never on a model holding defaults for refused fields
+                self._run_hooks("before_save", new_entry, hook_ctx)
             row: dict[str, Any] | None = None
             try:
                 if not new_entry.load_problems:
@@ -2103,9 +2137,15 @@ class KBService:
                 f"({_UPDATE_ATTEMPTS} attempts); nothing was written. Read it again and retry."
             )
 
-        path, not_moved = self._templated_move(
-            repo, kb_config, new_entry, path, new_text, file_values
-        )
+        if new_entry.load_problems:
+            # The path template reads fields (`backlog/{status}`); on a model
+            # holding the default for a refused one it would move the file to
+            # a folder the file never named.
+            not_moved = None
+        else:
+            path, not_moved = self._templated_move(
+                repo, kb_config, new_entry, path, new_text, file_values
+            )
         if row is not None:
             row["file_path"] = str(path)
             self.db.register_kb(
@@ -2123,6 +2163,19 @@ class KBService:
         return WriteResult(
             entry=new_entry, warnings=warnings, changed=True, locked=locked, not_moved=not_moved
         )
+
+    @staticmethod
+    def _refuse_unloadable_result(entry_id: str, entry: Entry, unloadable_ok: bool) -> None:
+        """An in-process caller (``update_entry``, ``apply_operations``) reads
+        field values off the entry it gets back; a model that holds defaults for
+        refused fields is not one. Only a surface (``update``), which reads
+        the id, the type and the path, may be handed it."""
+        if entry.load_problems and not unloadable_ok:
+            fields = ", ".join(p["field"] for p in entry.load_problems)
+            raise ValidationError(
+                f"Cannot update '{entry_id}': the file would still not load as its type "
+                f"({fields}); fix those fields in the same update"
+            )
 
     @staticmethod
     def _refuse_conflicting_spellings(entry: Entry, updates: dict[str, Any]) -> None:

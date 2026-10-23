@@ -412,7 +412,7 @@ def test_get_returns_the_file_never_not_found(cli_world, tmp_path, name):
         problems = data["load_problems"]
         assert len(problems) == 1, problems
         assert problems[0]["field"] == "rank"
-        assert problems[0]["error"]
+        assert problems[0]["message"]
 
 
 @pytest.mark.parametrize("name", REPAIR_PARAMS)

@@ -1122,6 +1122,36 @@ hash was not computed: `GET /api/entries`, `GET /api/collections/{id}/entries`,
 answer from the index build their entries from index rows, which carry no
 hash. Read the entry by id for its hash.
 
+### `load_problems`: a file whose type will not fully load
+
+A file that declares a type whose loader refuses some of its values (a
+`backlog_item` with `rank: .inf`) is still read: `kb_get` (the entry dict),
+`pyrite get` and REST `GET /api/entries/{id}` return the entry as the type it
+declares, with a `load_problems` list. The key is present only then.
+
+```json
+{
+  "id": "x", "entry_type": "backlog_item", "title": "T",
+  "load_problems": [
+    {"field": "rank", "rule": "load", "severity": "warning",
+     "message": "rank: cannot convert float infinity to integer"}
+  ]
+}
+```
+
+- **A refused field is absent, never a default.** `rank` is not in the reply
+  (not `0`), and a refused `status` is not `proposed`. The REST response model
+  spells a column the read does not carry as `null`. `field` is the file's key;
+  a value under `metadata:` is `metadata.rank`, and the field is then absent
+  from the top level and from `metadata`.
+- **The same dict as an update warning.** `load_problems` items and the
+  `warnings` of an `update` that leaves the refused field alone have one
+  shape (`field`, `rule: "load"`, `severity`, `message`), so a client handles
+  one thing.
+- **Never written back.** An update that carries `load_problems` (an echoed
+  read) sets it aside in `ignored`; nothing is written for it.
+- A missing required key is not covered: that file still reads as not found.
+
 ### Backlink rows
 
 Each row in `backlinks` (and in `pyrite backlinks`, MCP `kb_backlinks`) reads

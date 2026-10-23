@@ -372,14 +372,22 @@ class Entry(ABC):
     # restyling the whole block (#46). Never read as data -- only as style.
     _source_frontmatter: Any = field(default=None, init=False, repr=False, compare=False)
 
-    # Fields of the file the declared type's loader refused, ``[{"field",
-    # "error"}]``, on an entry loaded with ``partial=True`` (a single-entry read
-    # or an update, ADR-0042 decisions 8 and 9). The entry is of the declared
-    # type with those fields left out of the model; it is never saved from the
-    # model, so the file keeps the bytes it has. Empty for an entry that loaded.
+    # Fields of the file the declared type's loader refused, one warning-shaped
+    # dict each (``repository.load_problem``), on an entry loaded with
+    # ``partial=True`` (a single-entry read or an update, ADR-0042 decisions 8
+    # and 9). The entry is of the declared type built WITHOUT those keys, so
+    # the model holds the type's DEFAULT for each (``rank: 0``, ``status:
+    # proposed``): a dataclass cannot lack an attribute. That default is not the
+    # file's value. Every consumer must treat the names in ``load_problems``
+    # (``schema.field_aliases.refused_names``) as absent; the entry is never
+    # saved from the model. Empty for an entry that loaded.
     # Not a dataclass field (the field-name registries enumerate fields): a
-    # class-level default that ``_without_refused_fields`` shadows per entry.
+    # class-level default that ``mark_load_problems`` shadows per entry.
     load_problems: ClassVar[list[dict[str, str]]] = []
+
+    def mark_load_problems(self, problems: list[dict[str, str]]) -> None:
+        """Record the fields a partial load left out (``load_problems``)."""
+        object.__setattr__(self, "load_problems", problems)
 
     # A create's declared fields, ``{file key: attribute | None}`` (#86,
     # #1108), where None identifies a metadata-held field. Set from the schema

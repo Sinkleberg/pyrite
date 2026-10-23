@@ -264,6 +264,29 @@ def field_at(cls: type, entry_type: str, path: Any) -> tuple[str, tuple[Any, ...
     return aliases.get(key, key), tuple(rest)
 
 
+def refused_names(entry: Any) -> frozenset[str]:
+    """Every name a field the loader refused goes by in a read or a validated
+    field set: the file key's last segment (``metadata.rank`` -> ``rank``), the
+    field it denotes, and every alias of that field. Empty for an entry that
+    loaded. The partial model holds the type's default for these names; a
+    consumer that presents, validates or acts on field values drops them
+    (``KBService`` and ``IndexManager.read_fields`` do)."""
+    problems = getattr(entry, "load_problems", None)
+    if not problems:
+        return frozenset()
+    cls, entry_type = type(entry), entry.entry_type
+    aliases = class_field_aliases(cls, entry_type)
+    names: set[str] = set()
+    for problem in problems:
+        leaf = str(problem["field"]).rsplit(".", 1)[-1]
+        names.add(leaf)
+        names.add(aliases.get(leaf, leaf))
+        for alias, target in aliases.items():
+            if leaf in (alias, target):
+                names.update((alias, target))
+    return frozenset(names)
+
+
 def spellings_of(cls: type, entry_type: str, field: str) -> list[tuple[str, ...]]:
     """Every path at which a file (or a request) may spell ``field`` for a
     type, in the order a reader prefers them: the field's own name, each
